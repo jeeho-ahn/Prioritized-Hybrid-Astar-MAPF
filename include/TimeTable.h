@@ -26,12 +26,19 @@ public:
         if (traj.waypoints.empty()) return;
         double min_t = traj.waypoints.front().time;
         double max_t = traj.waypoints.back().time;
+        double initial_obj_yaw = 0.0;
+        double robot_start_yaw = traj.waypoints.front().yaw;
+        if (traj.is_transfer && traj.transferred_object) {
+            initial_obj_yaw = get_pose(traj.transferred_object, min_t).yaw;
+        }
         for (double t = 0.0; t <= max_t + time_increment; t += time_increment) {
             if (t >= min_t && t <= max_t) {
                 Pose p = interpolate_waypoints(traj.waypoints, t);
                 per_entity_table[ent][t] = p;
                 if (traj.is_transfer && traj.transferred_object) {
                     Pose obj_p = compute_object_pose(p, ent->size, traj.transferred_object->size);
+                    double delta_yaw = mod2pi(p.yaw - robot_start_yaw);
+                    obj_p.yaw = mod2pi(initial_obj_yaw + delta_yaw);
                     per_entity_table[traj.transferred_object][t] = obj_p;
                 }
             }
@@ -41,12 +48,16 @@ public:
         per_entity_table[ent][min_t] = p_min;
         if (traj.is_transfer && traj.transferred_object) {
             Pose obj_p_min = compute_object_pose(p_min, ent->size, traj.transferred_object->size);
+            double delta_yaw = mod2pi(p_min.yaw - robot_start_yaw);
+            obj_p_min.yaw = mod2pi(initial_obj_yaw + delta_yaw);
             per_entity_table[traj.transferred_object][min_t] = obj_p_min;
         }
         Pose p_max = traj.waypoints.back();
         per_entity_table[ent][max_t] = p_max;
         if (traj.is_transfer && traj.transferred_object) {
             Pose obj_p_max = compute_object_pose(p_max, ent->size, traj.transferred_object->size);
+            double delta_yaw = mod2pi(p_max.yaw - robot_start_yaw);
+            obj_p_max.yaw = mod2pi(initial_obj_yaw + delta_yaw);
             per_entity_table[traj.transferred_object][max_t] = obj_p_max;
         }
     }
