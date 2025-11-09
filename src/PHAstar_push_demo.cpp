@@ -1,15 +1,15 @@
-/*************************************
- * Prioritized Hybrid Astar Demo
+/*****************************************************************
+ * Prioritized Hybrid Astar Demo with Pushing Tasks from ReloPush
  *
- * 2025.10.24
+ * 2025.11.9
  * Jeeho Ahn, jeeho@umich.edu
-*************************************/
+******************************************************************/
 
 #include <Reeds_Shepp.h>
 #include <Visualization.h>
-
 #include <PHAstar.h>
-#include <iomanip>
+#include <config.h> // to parse CMake project directory
+#include <LoadFinalSequence.h>
 
 const bool print_path = false;
 
@@ -71,6 +71,22 @@ std::vector<std::tuple<std::string, Pose, bool, std::string, double>> initialize
 
 
 int main(int argc, char** argv) {
+    //////// test loading sequence from file ////////
+    std::string filename = std::string(CMAKE_SOURCE_DIR) + "/test_sequence.b64";
+
+    std::cout << filename << std::endl;
+
+    std::vector<FinalAllocation> loadedSequence = loadFinalSequenceFromFile(filename);
+
+    if (loadedSequence.empty()) {
+        std::cerr << "Failed to load finalSequence from " << filename << std::endl;
+        return 1;
+    }
+
+    std::cout << "Loaded " << loadedSequence.size() << " allocations from " << filename << std::endl;
+    ////////
+
+
     Params params = initialize_params();
 
     auto entities = initialize_entities();

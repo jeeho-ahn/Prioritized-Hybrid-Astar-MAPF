@@ -9,6 +9,7 @@ set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
 
+configure_file (${CMAKE_CURRENT_SOURCE_DIR}/include/config.h.in ${CMAKE_CURRENT_SOURCE_DIR}/include/config.h @ONLY)
 
 ## Path Visualization
 # First, try to find Qt6 with the Widgets component quietly.
@@ -34,7 +35,7 @@ else()
     add_compile_definitions(USE_QT5)
 endif()
 
-include_directories(include)
+include_directories(include include/fromReloPush)
 
 add_executable(phastar_demo
     src/PHAstar_demo.cpp
@@ -42,6 +43,7 @@ add_executable(phastar_demo
 
 add_executable(phastar_push_demo
     src/PHAstar_push_demo.cpp
+    src/fromReloPush/base64.cpp # for importing task sequence from file
 )
 
 target_link_libraries(phastar_demo PRIVATE
