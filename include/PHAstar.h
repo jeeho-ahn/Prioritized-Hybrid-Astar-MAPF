@@ -65,7 +65,10 @@ bool rectangles_intersect(const Corners& corners1, const Corners& corners2) {
 
 bool is_in_bounds(const Corners& corners, double min_x, double max_x, double min_y, double max_y) {
     for (const auto& c : corners) {
-        if (!(min_x <= c.x && c.x <= max_x && min_y <= c.y && c.y <= max_y)) return false;
+        if (!(min_x <= c.x && c.x <= max_x && min_y <= c.y && c.y <= max_y)) {
+            std::cout << "Out of bounds for corner: x=" << c.x << ", y=" << c.y << std::endl;
+            return false;
+        }
     }
     return true;
 }
@@ -395,13 +398,36 @@ public:
         open_set.emplace(calc_f(start.get()), node_id++, start.get());
         std::unordered_set<size_t> closed_set;
 
+
+        size_t iteration = 0; // for debug
         while (!open_set.empty()) {
+            iteration++;
+            if (iteration % 1000 == 0) {
+                std::cout << "A* iteration: " << iteration << ", open_set size: " << open_set.size()
+                          << ", current f-cost: " << std::get<0>(open_set.top()) << std::endl;
+            }
+
+
+
             auto [f, _, current] = open_set.top();
             open_set.pop();
+
+
+
+
             size_t n_id = calc_grid_index(current);
             if (closed_set.count(n_id)) continue;
             if (current->cost > g_costs[n_id]) continue;  // Outdated entry
             closed_set.insert(n_id);
+
+
+            // for debug
+            if (iteration % 5000 == 0) {
+                std::cout << "  Current node: t=" << current->t << ", x=" << current->x << ", y=" << current->y << ", yaw=" << current->yaw
+                          << ", cost=" << current->cost << std::endl;
+            }
+
+
 
             if (!check_collision_at(current)) continue;
 
@@ -426,6 +452,9 @@ public:
                         return waypoints;
                     }
                     // Else continue searching
+                    else {
+                        std::cout << "Analytic (Reeds-Shepp) path generated but rejected due to collision or bounds violation" << std::endl;
+                    }
                 }
             }
 
@@ -471,6 +500,7 @@ public:
     }
 };
 
+
 std::vector<Trajectory> perform_planning(
     const std::unordered_map<std::string, EntityMeta*>& entities,
     const std::vector<std::tuple<std::string, Pose, bool, std::string, double>>& robot_plans,
@@ -488,6 +518,11 @@ std::vector<Trajectory> perform_planning(
         double current_start_t = (provided_start_t > 0.0) ? provided_start_t : robot_current_times[r_name];  // Use provided if >0, else dynamic
         Pose start_pose = robot_current_poses.count(r_name) ? robot_current_poses[r_name] : r->initial_pose;
         r->initial_pose = start_pose;  // Temporarily set for planner
+
+        std::cout << "Starting planning for " << r_name << (trans ? " transfer with " + obj_name : " transit")
+                  << ": start_t=" << current_start_t
+                  << ", start_pose=(x=" << start_pose.x << ", y=" << start_pose.y << ", yaw=" << start_pose.yaw << ")"
+                  << ", goal_pose=(x=" << goal_pose.x << ", y=" << goal_pose.y << ", yaw=" << goal_pose.yaw << ")" << std::endl;
 
         PHAStar planner(r, goal_pose, &timetable, &entities, params, trans, obj_name, current_start_t);
         auto start_time = std::chrono::high_resolution_clock::now();

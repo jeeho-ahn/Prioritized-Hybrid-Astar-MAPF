@@ -102,6 +102,20 @@ public:
         return obj_pose;
     }
 
+    static Pose interpolate_waypoints(const std::vector<Waypoint>& waypoints, double t) {
+        if (waypoints.empty()) {
+            return {};
+        }
+        if (t <= waypoints.front().time) return waypoints.front();
+        if (t >= waypoints.back().time) return waypoints.back();
+        for (size_t i = 0; i < waypoints.size() - 1; ++i) {
+            if (waypoints[i].time <= t && t <= waypoints[i + 1].time) {
+                return interpolate_pose(waypoints[i], waypoints[i].time, waypoints[i + 1], waypoints[i + 1].time, t);
+            }
+        }
+        return waypoints.back();
+    }
+
 private:
     std::unordered_map<EntityMeta*, std::map<double, Pose>> per_entity_table;
 
@@ -120,19 +134,7 @@ private:
         return p;
     }
 
-    static Pose interpolate_waypoints(const std::vector<Waypoint>& waypoints, double t) {
-        if (waypoints.empty()) {
-            return {};
-        }
-        if (t <= waypoints.front().time) return waypoints.front();
-        if (t >= waypoints.back().time) return waypoints.back();
-        for (size_t i = 0; i < waypoints.size() - 1; ++i) {
-            if (waypoints[i].time <= t && t <= waypoints[i + 1].time) {
-                return interpolate_pose(waypoints[i], waypoints[i].time, waypoints[i + 1], waypoints[i + 1].time, t);
-            }
-        }
-        return waypoints.back();
-    }
+
 };
 
 void print_timetable_poses(const std::unordered_map<std::string, EntityMeta*>& entities, const std::vector<Trajectory>& all_trajectories, const TimeTable& timetable)
