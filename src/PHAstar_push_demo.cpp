@@ -175,7 +175,7 @@ int main(int argc, char** argv) {
         std::string obj_name = task.targetObject->name;
 
         // Transit to start pose
-        Pose start_robot = task.calcStartPoseRobot();
+        Pose start_robot = task.calcStartPoseRobot(); // goal of transit
         plans.emplace_back(r_name, start_robot, false, "", 0.0);
         std::cout << "Planning transit for " << r_name << " to start pose for " << obj_name << std::endl;
 
