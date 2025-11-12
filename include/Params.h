@@ -8,10 +8,10 @@ struct Params {
     double yaw_resolution = M_PI / 6.0; // 30 degrees
     double time_step = 2.0;
     double time_resolution = time_step;
-    double min_x = 0.0;
-    double min_y = 0.0;
-    double max_x = 5.0;
-    double max_y = 5.0;
+    double min_x = -3.0;
+    double min_y = -3.0;
+    double max_x = 8.0;
+    double max_y = 8.0;
     double max_steer = M_PI / 6.0; // 30 degrees
     double turn_penalty = 1.25;
     double reverse_penalty = 50.0;

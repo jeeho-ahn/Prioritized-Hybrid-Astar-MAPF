@@ -242,7 +242,7 @@ private:
         double dy = goal->y - node->y;
         double dist = std::hypot(dx, dy);
         if (dist > params.analytic_threshold) return {{}, 0.0};
-        auto [rs_x, rs_y, rs_yaw, _, rs_lengths, _, _] = reeds_shepp_path_planning(node->x, node->y, node->yaw, goal->x, goal->y, goal->yaw, max_curvature, params.rs_step_size, wheel_base);
+        auto [rs_x, rs_y, rs_yaw, ctypes, rs_lengths, steers, dirs] = reeds_shepp_path_planning(node->x, node->y, node->yaw, goal->x, goal->y, goal->yaw, max_curvature, params.rs_step_size, wheel_base);
         if (rs_x.empty()) return {{}, 0.0};
         double rs_length = 0.0;
         for (double l : rs_lengths) rs_length += std::abs(l);

@@ -114,7 +114,7 @@ std::unordered_map<std::string, EntityMeta*> initialize_entities(const std::vect
 
 int main(int argc, char** argv) {
     //////// test loading sequence from file ////////
-    std::string filename = std::string(CMAKE_SOURCE_DIR) + "/test_sequence.b64";
+    std::string filename = std::string(CMAKE_SOURCE_DIR) + "/test_sequence2.b64";
 
     std::cout << filename << std::endl;
 
@@ -145,8 +145,8 @@ int main(int argc, char** argv) {
     if (!loadedSequence.empty()) {
         const auto& bound = loadedSequence[0].snapshot.parameters.boundary;
         std::cout << "Workspace boundary: xMin=" << bound.xMin << ", yMin=" << bound.yMin << ", xMax=" << bound.xMax << ", yMax=" << bound.yMax << std::endl;
-        params.min_x = -2.0;//bound.xMin;
-        params.min_y = -2.0;//bound.yMin;
+        params.min_x = bound.xMin;
+        params.min_y = bound.yMin;
         params.max_x = bound.xMax;
         params.max_y = bound.yMax;
     }
