@@ -24,41 +24,47 @@ public:
     void add_trajectory(const Trajectory& traj) {
         EntityMeta* ent = traj.entity;
         if (traj.waypoints.empty()) return;
-        double min_t = traj.waypoints.front().time;
-        double max_t = traj.waypoints.back().time;
+        double min_relative = traj.waypoints.front().time;
+        double max_relative = traj.waypoints.back().time;
+        double offset = traj.start_time;
+        double absolute_min_t = offset + min_relative;
+        double absolute_max_t = offset + max_relative;
         double initial_obj_yaw = 0.0;
         double robot_start_yaw = traj.waypoints.front().yaw;
         if (traj.is_transfer && traj.transferred_object) {
-            initial_obj_yaw = get_pose(traj.transferred_object, min_t).yaw;
+            initial_obj_yaw = get_pose(traj.transferred_object, absolute_min_t).yaw;
         }
-        for (double t = 0.0; t <= max_t + time_increment; t += time_increment) {
-            if (t >= min_t && t <= max_t) {
-                Pose p = interpolate_waypoints(traj.waypoints, t);
-                per_entity_table[ent][t] = p;
+        for (double absolute_t = absolute_min_t; absolute_t <= absolute_max_t + time_increment; absolute_t += time_increment) {
+            double relative_t = absolute_t - offset;
+            if (relative_t >= min_relative && relative_t <= max_relative) {
+                Pose p = interpolate_waypoints(traj.waypoints, relative_t);
+                per_entity_table[ent][absolute_t] = p;
                 if (traj.is_transfer && traj.transferred_object) {
                     Pose obj_p = compute_object_pose(p, ent->size, traj.transferred_object->size);
                     double delta_yaw = mod2pi(p.yaw - robot_start_yaw);
                     obj_p.yaw = mod2pi(initial_obj_yaw + delta_yaw);
-                    per_entity_table[traj.transferred_object][t] = obj_p;
+                    per_entity_table[traj.transferred_object][absolute_t] = obj_p;
                 }
             }
         }
         // Explicitly add the first and last waypoints
-        Pose p_min = traj.waypoints.front();
-        per_entity_table[ent][min_t] = p_min;
+        double relative_min = min_relative;
+        Pose p_min = interpolate_waypoints(traj.waypoints, relative_min);
+        per_entity_table[ent][absolute_min_t] = p_min;
         if (traj.is_transfer && traj.transferred_object) {
             Pose obj_p_min = compute_object_pose(p_min, ent->size, traj.transferred_object->size);
             double delta_yaw = mod2pi(p_min.yaw - robot_start_yaw);
             obj_p_min.yaw = mod2pi(initial_obj_yaw + delta_yaw);
-            per_entity_table[traj.transferred_object][min_t] = obj_p_min;
+            per_entity_table[traj.transferred_object][absolute_min_t] = obj_p_min;
         }
-        Pose p_max = traj.waypoints.back();
-        per_entity_table[ent][max_t] = p_max;
+        double relative_max = max_relative;
+        Pose p_max = interpolate_waypoints(traj.waypoints, relative_max);
+        per_entity_table[ent][absolute_max_t] = p_max;
         if (traj.is_transfer && traj.transferred_object) {
             Pose obj_p_max = compute_object_pose(p_max, ent->size, traj.transferred_object->size);
             double delta_yaw = mod2pi(p_max.yaw - robot_start_yaw);
             obj_p_max.yaw = mod2pi(initial_obj_yaw + delta_yaw);
-            per_entity_table[traj.transferred_object][max_t] = obj_p_max;
+            per_entity_table[traj.transferred_object][absolute_max_t] = obj_p_max;
         }
     }
 
@@ -91,6 +97,24 @@ public:
             poses[ent] = get_pose(ent, t);
         }
         return poses;
+    }
+
+    double get_max_time() const {
+        double max_t = 0.0;
+        for (const auto& [ent, m] : per_entity_table) {
+            if (!m.empty()) {
+                max_t = std::max(max_t, m.rbegin()->first);
+            }
+        }
+        return max_t;
+    }
+
+    double get_entity_max_time(EntityMeta* ent, double margin=0.5) const {
+        auto it = per_entity_table.find(ent);
+        if (it == per_entity_table.end() || it->second.empty()) {
+            return 0.0;
+        }
+        return it->second.rbegin()->first + margin;
     }
 
     static Pose compute_object_pose(const Pose& robot_pose, const OccuRect& robot_size, const OccuRect& obj_size) {

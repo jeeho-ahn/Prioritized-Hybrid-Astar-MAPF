@@ -19,13 +19,64 @@ Params initialize_params() {
     return params;
 }
 
+Pose PoseFromReloPushState(const ReloPush::State& state_in)
+{
+    Pose p;
+    p.x = state_in.x;
+    p.y = state_in.y;
+    p.yaw = state_in.yaw;
+
+    return p;
+}
+
+Waypoint WaypointFromReloPushState(const ReloPush::State& state_in)
+{
+    Pose p = PoseFromReloPushState(state_in);
+
+    Waypoint wp(p);
+    wp.time = state_in.time;
+    wp.linear_velocity = state_in.vel;
+
+    return wp;
+}
+
+TrajectoryPtr ReloPushPath2TrajPtr(const std::shared_ptr<EdgePath> edge) {
+    Trajectory traj;
+    traj.entity = nullptr;
+    traj.transferred_object = nullptr;
+    traj.start_time = 0.0;
+    traj.is_transfer = edge->is_pushing;
+
+    if (!std::holds_alternative<ReloPush::StatePathPtr>(edge->path)) {
+        return std::make_shared<Trajectory>(traj); // Empty if not StatePath
+    }
+    const auto& path_ptr = std::get<ReloPush::StatePathPtr>(edge->path);
+    if (!path_ptr || path_ptr->empty()) {
+        return std::make_shared<Trajectory>(traj);
+    }
+    const auto& states = *path_ptr;
+    //traj.start_time = states[0].time;
+    traj.start_time = -1; // time not assigned yet
+    for (const auto& state : states) {
+        Waypoint wp = WaypointFromReloPushState(state);
+        wp.steering_angle = 0.0; // Not provided
+        traj.waypoints.push_back(wp);
+    }
+    return std::make_shared<Trajectory>(traj);
+}
+
+
 enum DependType { TRANSIT, TRANSFER };
 
 class Task {
 public:
-    std::vector<Trajectory> transitTrajectoryRobot;
-    std::vector<Trajectory> transferTrajectoryRobot;
-    Pose transitGoal;
+    std::vector<Trajectory> transitTrajectoryRobot; // to be depricated
+    std::vector<Trajectory> transferTrajectoryRobot; // to be depricated
+
+    std::vector<TrajectoryPtr> EdgePaths;
+
+    Pose transitGoal; // to be depricated
+    Pose TaskStartPoseRobot; // starting pose of the task
     Pose StartPoseObj;
     Pose GoalPoseObj;
     std::pair<Task*, DependType> transferDepend;
@@ -33,10 +84,30 @@ public:
     RobotMeta* assignedRobot = nullptr;
     ObjectMeta* targetObject = nullptr;
 
+    // constructor without assigned robot
     Task(const FinalAllocation& fa, const std::unordered_map<std::string, EntityMeta*>& entities) {
         StartPoseObj = {fa.startPose.x, fa.startPose.y, fa.startPose.yaw};
         GoalPoseObj = {fa.goalPose.x, fa.goalPose.y, fa.goalPose.yaw};
         targetObject = dynamic_cast<ObjectMeta*>(entities.at(fa.object.name));
+
+        // Goal of first transit as the starting pose of the task
+        TaskStartPoseRobot = PoseFromReloPushState(fa.firstApproachPath->back());
+
+        // todo: obs relo path
+
+        EdgePaths.clear();
+        // parse trajectories
+        //  each edge-path
+        for(auto& epath : fa.paths)
+        {
+            // trajectory (normal: one transfer, prerelo: transfer-transit-transfer)
+            for(auto& path : epath.paths)
+            {
+                auto traj_in = ReloPushPath2TrajPtr(path);
+                traj_in->transferred_object = targetObject; // assume task target is always the object to transer
+                EdgePaths.emplace_back(traj_in); // time not assigned yet (needs robot first)
+            }
+        }
     }
 
     Pose calcRobotPoseFromObj(const Pose& pose_in) {
@@ -52,6 +123,7 @@ public:
         return robot_pose;
     }
 
+    // todo: need to choose which one to use: Pose from path or this function
     Pose calcStartPoseRobot() {
         if (!assignedRobot || !targetObject) {
             std::cerr << "Assigned robot or target object not set." << std::endl;
@@ -153,12 +225,14 @@ int main(int argc, char** argv) {
 
     auto entities = initialize_entities(loadedSequence);
 
+    // Init tasks from planned sequence
     std::vector<Task> tasks;
     for (const auto& fa : loadedSequence) {
         tasks.emplace_back(fa, entities);
     }
 
     // Allocate first m tasks to m robots (m=2)
+    // todo: find better allocation
     std::vector<std::string> robots = {"robot1", "robot2"};
     size_t m = robots.size();
     for (size_t i = 0; i < std::min(m, tasks.size()); ++i) {
@@ -166,8 +240,52 @@ int main(int argc, char** argv) {
         std::cout << "Assigned task for object " << tasks[i].targetObject->name << " to " << robots[i] << std::endl;
     }
 
+
+    TimeTable timetable(0.5);
+    timetable.add_initial(entities);
+
     // Construct plans based on tasks
-    std::vector<std::tuple<std::string, Pose, bool, std::string, double>> plans;
+
+    //std::vector<std::tuple<std::string, Pose, bool, std::string, double>> plans;
+    for (auto& task : tasks)
+    {
+        //auto task = tasks[i];
+        // plan the first transit
+        RobotMeta* r = task.assignedRobot;
+        // robot pose at starting time
+        double start_time = 0; //todo: find time by searching table
+        auto robot_pose_at_start = timetable.get_pose(r,start_time);
+        auto task_start_pose = task.TaskStartPoseRobot;
+        PHAStar planner(r, task_start_pose, &timetable, &entities, params, false, "", start_time);
+        auto waypoints = planner.planning();
+        Trajectory traj;
+        traj.entity = r;
+        traj.start_time = start_time;
+        traj.waypoints = waypoints;
+        traj.is_transfer = false;
+        traj.transferred_object = traj.is_transfer ? entities.at("") : nullptr;
+        //all_trajectories.push_back(traj);
+        timetable.add_trajectory(traj);
+
+        for(auto& it : task.EdgePaths)
+        {
+            auto transit_end_time = timetable.get_entity_max_time(r);
+            // add the existing paths to TimeTable
+            auto traj_to_reg = it;
+            traj_to_reg->entity = r;
+
+            traj_to_reg->CalcualteTimeStamps(r);
+            traj_to_reg->start_time = transit_end_time;
+            traj_to_reg->is_transfer = it->is_transfer;
+
+            traj_to_reg->transferred_object = traj_to_reg->is_transfer ? it->transferred_object : nullptr;
+            timetable.add_trajectory(*traj_to_reg);
+        }
+    }
+    show_results(argc, argv, timetable, entities, params);
+
+
+    /*
     for (auto& task : tasks) {
         if (!task.assignedRobot) continue;
 
@@ -179,14 +297,18 @@ int main(int argc, char** argv) {
         plans.emplace_back(r_name, start_robot, false, "", 0.0);
         std::cout << "Planning transit for " << r_name << " to start pose for " << obj_name << std::endl;
 
-        // Transfer to goal
+        // Transfer to goal (extract from FA)
         Pose goal_robot = task.calcRobotPoseFromObj(task.GoalPoseObj);
         plans.emplace_back(r_name, goal_robot, true, obj_name, 0.0);
         std::cout << "Planning transfer for " << r_name << " with " << obj_name << " to goal" << std::endl;
 
+        //Pose goal_robot = task.
+
+
         // Set goal pose for object
         task.targetObject->goal_pose = task.GoalPoseObj;
     }
+
 
     for (auto& task : tasks) {
         if (task.assignedRobot) {
@@ -201,15 +323,16 @@ int main(int argc, char** argv) {
                       << "\n  Calc goal robot pose=(x=" << goal_robot.x << ", y=" << goal_robot.y << ", yaw=" << goal_robot.yaw << ")" << std::endl;
         }
     }
+*/
 
-    TimeTable timetable(0.5);
-    timetable.add_initial(entities);
+    /*
 
     auto all_trajectories = perform_planning(entities, plans, timetable, params, print_path);
 
     print_timetable_poses(entities, all_trajectories, timetable);
 
     show_results(argc, argv, timetable, entities, all_trajectories, params);
+    */
 
     // Clean up memory (optional, since program ends)
     for (auto& pair : entities) {

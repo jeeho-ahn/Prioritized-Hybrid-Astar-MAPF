@@ -66,7 +66,7 @@ bool rectangles_intersect(const Corners& corners1, const Corners& corners2) {
 bool is_in_bounds(const Corners& corners, double min_x, double max_x, double min_y, double max_y) {
     for (const auto& c : corners) {
         if (!(min_x <= c.x && c.x <= max_x && min_y <= c.y && c.y <= max_y)) {
-            std::cout << "Out of bounds for corner: x=" << c.x << ", y=" << c.y << std::endl;
+            //std::cout << "Out of bounds for corner: x=" << c.x << ", y=" << c.y << std::endl;
             return false;
         }
     }
@@ -242,7 +242,7 @@ private:
         double dy = goal->y - node->y;
         double dist = std::hypot(dx, dy);
         if (dist > params.analytic_threshold) return {{}, 0.0};
-        auto [rs_x, rs_y, rs_yaw, ctypes, rs_lengths, steers, dirs] = reeds_shepp_path_planning(node->x, node->y, node->yaw, goal->x, goal->y, goal->yaw, max_curvature, params.rs_step_size, wheel_base);
+        auto [rs_x, rs_y, rs_yaw, ctypes, rs_lengths, steers, dirs] = ReedShepp::reeds_shepp_path_planning(node->x, node->y, node->yaw, goal->x, goal->y, goal->yaw, max_curvature, params.rs_step_size, wheel_base);
         if (rs_x.empty()) return {{}, 0.0};
         double rs_length = 0.0;
         for (double l : rs_lengths) rs_length += std::abs(l);
@@ -299,7 +299,7 @@ private:
     }
 
     double calc_heuristic(Node* node) {
-        auto [_, __, ___, ____, lengths, _____, ______] = reeds_shepp_path_planning(
+        auto [_, __, ___, ____, lengths, _____, ______] = ReedShepp::reeds_shepp_path_planning(
             node->x, node->y, node->yaw, goal->x, goal->y, goal->yaw, max_curvature, params.rs_step_size * 10, wheel_base
             );
         if (lengths.empty()) return std::numeric_limits<double>::infinity();
@@ -324,7 +324,7 @@ private:
         }
         std::reverse(waypoints.begin(), waypoints.end());
         if (!rs_path.empty()) {
-            auto [rs_x, rs_y, rs_yaw, rs_ctypes, rs_lengths, rs_steers, rs_directions] = reeds_shepp_path_planning(
+            auto [rs_x, rs_y, rs_yaw, rs_ctypes, rs_lengths, rs_steers, rs_directions] = ReedShepp::reeds_shepp_path_planning(
                 node->x, node->y, node->yaw, goal->x, goal->y, goal->yaw, max_curvature, params.rs_step_size, wheel_base
                 );
             double rs_t = waypoints.back().time;
@@ -345,7 +345,9 @@ private:
     }
 
 public:
-    PHAStar(RobotMeta* r, const Pose& goal_pose, TimeTable* tt, const std::unordered_map<std::string, EntityMeta*>* ents, const Params& p, bool trans = false, const std::string& obj_name = "", double start_t = 0.0)
+    // robot, goal, timetable, entities, params, is_transfer, obj_name, start_time
+    PHAStar(RobotMeta* r, const Pose& goal_pose, TimeTable* tt, const std::unordered_map<std::string, EntityMeta*>* ents,
+            const Params& p, bool trans = false, const std::string& obj_name = "", double start_t = 0.0)
         : robot(r), timetable(tt), entities(ents), is_transfer(trans), params(p) {
         // Update initial pose if chaining (but for now, assume caller updates r->initial_pose if needed)
         start = std::make_unique<Node>(r->initial_pose.x, r->initial_pose.y, r->initial_pose.yaw, start_t, 0.0, 0.0, nullptr, 1);
