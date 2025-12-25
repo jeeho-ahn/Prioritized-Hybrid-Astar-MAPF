@@ -11,6 +11,14 @@ enum class EntityType { ROBOT, OBJECT };
 
 struct Pose : public Point {
     double yaw = 0.0;
+
+    Pose(){}
+
+    Pose(double x_in, double y_in, double yaw_in) : yaw(yaw_in)
+    {
+        x = x_in;
+        y = y_in;
+    }
 };
 
 struct OccuRect {

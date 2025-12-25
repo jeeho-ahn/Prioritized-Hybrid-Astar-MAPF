@@ -25,20 +25,28 @@
 #include <Params.h>
 #include <TimeTable.h>
 
+std::tuple<double, double, double> interpolate_timed_path(const std::vector<Waypoint> &waypoints, double t)
+{
+    if (t <= waypoints[0].time)
+        return {waypoints[0].x, waypoints[0].y, waypoints[0].yaw};
+    if (t >= waypoints.back().time)
+        return {waypoints.back().x, waypoints.back().y, waypoints.back().yaw};
 
-std::tuple<double, double, double> interpolate_timed_path(const std::vector<Waypoint>& waypoints, double t) {
-    if (t <= waypoints[0].time) return {waypoints[0].x, waypoints[0].y, waypoints[0].yaw};
-    if (t >= waypoints.back().time) return {waypoints.back().x, waypoints.back().y, waypoints.back().yaw};
-    for (size_t i = 0; i < waypoints.size() - 1; ++i) {
-        auto& wp1 = waypoints[i];
-        auto& wp2 = waypoints[i + 1];
-        if (wp1.time <= t && t <= wp2.time) {
+    for (size_t i = 0; i < waypoints.size() - 1; ++i)
+    {
+        auto &wp1 = waypoints[i];
+        auto &wp2 = waypoints[i + 1];
+        if (wp1.time <= t && t <= wp2.time)
+        {
             double frac = (t - wp1.time) / (wp2.time - wp1.time);
             double x = wp1.x + frac * (wp2.x - wp1.x);
             double y = wp1.y + frac * (wp2.y - wp1.y);
-            double dyaw = mod2pi(wp2.yaw - wp1.yaw);
+
+            // FIX: Use pi_2_pi to get the shortest angular distance (range -PI to PI)
+            double dyaw = pi_2_pi(wp2.yaw - wp1.yaw);
+
             double yaw = wp1.yaw + frac * dyaw;
-            yaw = mod2pi(yaw);
+            yaw = mod2pi(yaw); // Keep the final result in [0, 2PI)
             return {x, y, yaw};
         }
     }
@@ -68,7 +76,7 @@ public:
     VizWidget_old(const TimeTable& tt, const std::unordered_map<std::string, EntityMeta*>& ents, const std::vector<Trajectory>& trajs, const Params& p)
         : timetable(tt), entities(ents), trajectories(trajs), params(p) {
         for (const auto& traj : trajectories) {
-            if (!traj.waypoints.empty()) max_t = std::max(max_t, traj.waypoints.back().time);
+            if (!traj.waypoints.empty()) max_t = timetable.get_max_time();
         }
         setMinimumSize(600, 600);
     }
@@ -133,6 +141,10 @@ protected:
                 p.setPen(QPen(QColor("FFD6BA"), 2));
                 p.drawLine(screen_x(pose.x), screen_y(pose.y), screen_x(front_x), screen_y(front_y));
             }
+
+            // Draw Name
+            p.setPen(Qt::black);
+            p.drawText(QPointF(screen_x(pose.x), screen_y(pose.y)), QString::fromStdString(ent->name));
         }
     }
 };
@@ -212,6 +224,10 @@ protected:
                 p.setPen(QPen(QColor("FFD6BA"), 2));
                 p.drawLine(screen_x(pose.x), screen_y(pose.y), screen_x(front_x), screen_y(front_y));
             }
+
+            // Draw Name
+            p.setPen(Qt::black);
+            p.drawText(QPointF(screen_x(pose.x), screen_y(pose.y)), QString::fromStdString(ent->name));
         }
     }
 };
@@ -227,7 +243,7 @@ void show_results(int argc, char** argv, const TimeTable& timetable, const std::
     QSlider* slider = new QSlider(Qt::Horizontal);
     double max_t = 0.0;
     for (const auto& traj : all_trajectories) {
-        if (!traj.waypoints.empty()) max_t = std::max(max_t, traj.waypoints.back().time);
+        if (!traj.waypoints.empty()) max_t = timetable.get_max_time();
     }
     slider->setRange(0, static_cast<int>(max_t * 100));
     layout->addWidget(slider);

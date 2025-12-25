@@ -15,7 +15,8 @@ const bool print_path = false;
 
 Params initialize_params() {
     Params params;
-    params.analytic_threshold = 5.0 * params.max_steer;  // Adjust if needed
+    //params.analytic_threshold = 5.0 * params.max_steer;  // Adjust if needed
+    params.analytic_threshold = std::hypot(params.max_x - params.min_x, params.max_y - params.min_y) * 2.0;
     return params;
 }
 
@@ -61,7 +62,8 @@ std::unordered_map<std::string, EntityMeta*> initialize_entities() {
 
 std::vector<std::tuple<std::string, Pose, bool, std::string, double>> initialize_plans() {
     return {
-        {"robot1", {4.0, 4.0, M_PI / 2}, false, "", 0.0}, // agent name, goal pose, is it transferring item, ignore collision with, starting time
+        //{"robot1", {4.0, 4.0, M_PI / 2}, false, "", 0.0}, // agent name, goal pose, is it transferring item, ignore collision with, starting time
+        {"robot1", {4.82, 2, M_PI / 2}, false, "", 0.0}, // testing close to the edge
         {"robot2", {4.5, 1.0, M_PI / 2}, false, "", 0.0},
         {"robot2", {2.0, 3.0, 0.0}, false, "", 39.0}
     };

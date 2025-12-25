@@ -140,6 +140,47 @@ public:
         return waypoints.back();
     }
 
+    // Check if an entity is waiting (idle) at time t.
+    // "Waiting" is defined as: query time t is >= the end time of the last registered plan.
+    bool is_waiting(EntityMeta* ent, double time) const {
+        auto it = per_entity_table.find(ent);
+        if (it == per_entity_table.end()) return true; // No plan means waiting
+
+        const auto& plan = it->second;
+        if (plan.empty()) return true;
+
+        // Get the timestamp of the very last pose registered
+        double last_time = plan.rbegin()->first;
+
+        // If queried time is past the robot's last move, it is waiting
+        return time >= last_time;
+    }
+
+    // Find if any OTHER robot is blocking the target_pose at time t.
+    // Returns the pointer to the blocking entity if found, otherwise nullptr.
+    RobotMeta* get_blocking_robot(const Pose& target_pose, double t, TimeTable& timetable,
+                                  double margin_m = 0.1) {
+        // 1. Define geometry of the target pose (The robot wanting to go there)
+        // We assume standard robot size for the check
+        double length = 0.3 + margin_m; // approx front len
+        double width = 0.3 + margin_m;
+        Corners target_c = get_corners(target_pose.x, target_pose.y, target_pose.yaw, length, 0.2, width);
+
+        // 2. Check against all robots in TimeTable
+        auto others = timetable.get_poses(t);
+        for(auto& [ent, ent_pose] : others) {
+            if (ent->type != EntityType::ROBOT) continue; // Only clear robots
+
+            Corners ent_c = get_corners(ent_pose.x, ent_pose.y, ent_pose.yaw,
+                                        ent->size.front_length, ent->size.rear_length, ent->size.width);
+
+            if (rectangles_intersect(target_c, ent_c)) {
+                return dynamic_cast<RobotMeta*>(ent);
+            }
+        }
+        return nullptr;
+    }
+
 private:
     std::unordered_map<EntityMeta*, std::map<double, Pose>> per_entity_table;
 

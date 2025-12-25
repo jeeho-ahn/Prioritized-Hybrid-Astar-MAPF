@@ -15,53 +15,28 @@
 #include <TimeTable.h>
 
 // PHA* Implementation
-std::pair<double, double> project(const Corners& corners, const Point& axis) {
-    double min_d = std::numeric_limits<double>::infinity();
-    double max_d = -std::numeric_limits<double>::infinity();
-    for (const auto& c : corners) {
-        double dot = c.x * axis.x + c.y * axis.y;
-        min_d = std::min(min_d, dot);
-        max_d = std::max(max_d, dot);
-    }
-    return {min_d, max_d};
-}
 
-bool overlap(std::pair<double, double> p1, std::pair<double, double> p2) {
-    return p1.second >= p2.first && p2.second >= p1.first;
-}
+enum class PlanningStatus
+{
+    SUCCESS,
+    START_INVALID_COLLISION, // Start pose collides with entity
+    START_OUT_OF_BOUNDS,     // Start pose outside map bounds
+    GOAL_INVALID_COLLISION,  // Goal pose collides with entity
+    GOAL_OUT_OF_BOUNDS,      // Goal pose outside map bounds
+    NO_PATH_FOUND,           // Search exhausted without reaching goal
+    TIMEOUT_EXCEEDED,        // Max iterations/time limit hit
+    HIGH_COST_UNFEASIBLE,    // Path cost too high (e.g., excessive reverses)
+    INTERNAL_ERROR           // Generic (e.g., empty graph)
+};
 
-std::vector<Point> get_axes(const Corners& corners) {
-    std::vector<Point> axes;
-    for (size_t i = 0; i < 4; ++i) {
-        Point p1 = corners[i];
-        Point p2 = corners[(i + 1) % 4];
-        double ex = p2.x - p1.x;
-        double ey = p2.y - p1.y;
-        Point normal = {-ey, ex};
-        double norm = std::hypot(normal.x, normal.y);
-        if (norm > 0) {
-            normal.x /= norm;
-            normal.y /= norm;
-            axes.push_back(normal);
-        }
-    }
-    return axes;
-}
-
-bool rectangles_intersect(const Corners& corners1, const Corners& corners2) {
-    auto axes1 = get_axes(corners1);
-    auto axes2 = get_axes(corners2);
-    std::vector<Point> all_axes;
-    all_axes.reserve(axes1.size() + axes2.size());
-    all_axes.insert(all_axes.end(), axes1.begin(), axes1.end());
-    all_axes.insert(all_axes.end(), axes2.begin(), axes2.end());
-    for (const auto& axis : all_axes) {
-        auto p1 = project(corners1, axis);
-        auto p2 = project(corners2, axis);
-        if (!overlap(p1, p2)) return false;
-    }
-    return true;
-}
+struct PlanningResult
+{
+    std::vector<Waypoint> waypoints;
+    PlanningStatus status = PlanningStatus::INTERNAL_ERROR;
+    std::string failure_detail = "";   // Human-readable message
+    std::string colliding_entity = ""; // Name of entity causing collision (if applicable)
+    double failure_time = 0.0;         // Timestamp where collision/failure occurred (if relevant)
+};
 
 bool is_in_bounds(const Corners& corners, double min_x, double max_x, double min_y, double max_y) {
     for (const auto& c : corners) {
@@ -80,6 +55,7 @@ struct Node {
     int direction;
     Node(double x_ = 0, double y_ = 0, double yaw_ = 0, double t_ = 0, double cost_ = 0, double steer_ = 0, Node* p = nullptr, int dir = 1)
         : x(x_), y(y_), yaw(yaw_), t(t_), cost(cost_), steer(steer_), parent(p), direction(dir) {}
+
 };
 
 class PHAStar {
@@ -94,6 +70,11 @@ private:
     Params params;
     int x_width, y_width, theta_width, time_width;
     std::vector<double> entity_diags;
+
+    // For diagnostics
+    double max_planning_time = 10.0; // [s] timeout threshold (tune via params if needed)
+    int max_iterations = 100000;     // Prevent infinite loops
+    std::chrono::time_point<std::chrono::high_resolution_clock> start_clock;
 
     size_t calc_grid_index(const Node* node) {
         int ix = static_cast<int>((node->x - params.min_x) / params.xy_resolution);
@@ -241,9 +222,11 @@ private:
         double dx = goal->x - node->x;
         double dy = goal->y - node->y;
         double dist = std::hypot(dx, dy);
-        if (dist > params.analytic_threshold) return {{}, 0.0};
+        if (dist > params.analytic_threshold)
+            return {{}, 0.0};
         auto [rs_x, rs_y, rs_yaw, ctypes, rs_lengths, steers, dirs] = ReedShepp::reeds_shepp_path_planning(node->x, node->y, node->yaw, goal->x, goal->y, goal->yaw, max_curvature, params.rs_step_size, wheel_base);
-        if (rs_x.empty()) return {{}, 0.0};
+        if (rs_x.empty())
+            return {{}, 0.0};
         double rs_length = 0.0;
         for (double l : rs_lengths) rs_length += std::abs(l);
         std::vector<std::tuple<double, double, double>> rs_path;
@@ -352,6 +335,7 @@ public:
         // Update initial pose if chaining (but for now, assume caller updates r->initial_pose if needed)
         start = std::make_unique<Node>(r->initial_pose.x, r->initial_pose.y, r->initial_pose.yaw, start_t, 0.0, 0.0, nullptr, 1);
         goal = std::make_unique<Node>(goal_pose.x, goal_pose.y, goal_pose.yaw, 0.0, 0.0, 0.0, nullptr, 1);
+
         auto it = entities->find(obj_name);
         if (is_transfer) {
             transferred = dynamic_cast<ObjectMeta*>(it->second);
@@ -371,24 +355,238 @@ public:
         max_steer = std::atan(wheel_base * max_curvature);
         speed = is_transfer ? robot->speed_transfer : robot->speed_transit;
         params.movement_length = speed * params.time_step;
+
         motion_primitives = {
             {1, 0.0}, {1, max_steer}, {1, -max_steer}, {1, max_steer / 2}, {1, -max_steer / 2},
             {-1, 0.0}, {-1, max_steer}, {-1, -max_steer}, {-1, max_steer / 2}, {-1, -max_steer / 2},
             {0, 0.0}
         };
+
         x_width = static_cast<int>((params.max_x - params.min_x) / params.xy_resolution) + 1;
         y_width = static_cast<int>((params.max_y - params.min_y) / params.xy_resolution) + 1;
         theta_width = static_cast<int>(2 * M_PI / params.yaw_resolution);
         time_width = static_cast<int>(params.max_time / params.time_resolution) + 1;
+
         entity_diags.reserve(entities->size());
         for (const auto& [name, ent] : *entities) {
             if (ent == robot || ent == transferred || ent == ignored_entity) continue;
             double diag = std::sqrt((ent->size.front_length + ent->size.rear_length) * (ent->size.front_length + ent->size.rear_length) + ent->size.width * ent->size.width) / 2;
             entity_diags.push_back(diag);
         }
-        params.analytic_threshold = 5.0 * min_turn_radius;
+
+        //params.analytic_threshold = 5.0 * min_turn_radius;
+        start_clock = std::chrono::high_resolution_clock::now();
     }
 
+    // Check if a pose collides with any entity at given time (returns colliding entity name or "")
+    std::string check_pose_collision(const Pose &pose, double check_time, bool include_transferred = false)
+    {
+        Corners pose_corners = get_corners(pose.x, pose.y, pose.yaw,
+                                           robot->size.front_length, robot->size.rear_length, robot->size.width);
+
+        // Check bounds first
+        if (!is_in_bounds(pose_corners, params.min_x, params.max_x, params.min_y, params.max_y))
+        {
+            return "map_bounds";
+        }
+
+        // Check against timetable entities
+        auto current_poses = timetable->get_poses(check_time);
+        for (const auto &[ent, ent_pose] : current_poses)
+        {
+            if (ent == robot)
+                continue; // Skip self
+            if (!include_transferred && ent == transferred)
+                continue; // Skip object if pushing
+
+            Corners ent_corners = get_corners(ent_pose.x, ent_pose.y, ent_pose.yaw,
+                                              ent->size.front_length, ent->size.rear_length, ent->size.width);
+            if (rectangles_intersect(pose_corners, ent_corners))
+            {
+                return ent->name; // Return colliding entity name
+            }
+        }
+        return ""; // No collision
+    }
+
+    // Validate start/goal and return detailed result
+    PlanningResult validate_start_goal(double start_t, const Pose &goal_pose)
+    {
+        PlanningResult res;
+
+        // Start validation (at current time)
+        std::string start_collider = check_pose_collision(robot->initial_pose, start_t, is_transfer);
+        if (!start_collider.empty())
+        {
+            res.status = PlanningStatus::START_INVALID_COLLISION;
+            res.failure_detail = "Start pose collides with " + start_collider;
+            res.colliding_entity = start_collider;
+            res.failure_time = start_t;
+            return res;
+        }
+        if (start_collider == "map_bounds")
+        {
+            res.status = PlanningStatus::START_OUT_OF_BOUNDS;
+            res.failure_detail = "Start pose out of map bounds";
+            return res;
+        }
+
+        // Goal validation (at estimated arrival time; approximate as start_t + heuristic dist/speed)
+        double est_goal_time = start_t + std::hypot(goal_pose.x - robot->initial_pose.x, goal_pose.y - robot->initial_pose.y) / robot->speed_transit;
+        std::string goal_collider = check_pose_collision(goal_pose, est_goal_time, is_transfer);
+        if (!goal_collider.empty())
+        {
+            res.status = PlanningStatus::GOAL_INVALID_COLLISION;
+            res.failure_detail = "Goal pose collides with " + goal_collider + " at estimated t=" + std::to_string(est_goal_time);
+            res.colliding_entity = goal_collider;
+            res.failure_time = est_goal_time;
+            return res;
+        }
+        if (goal_collider == "map_bounds")
+        {
+            res.status = PlanningStatus::GOAL_OUT_OF_BOUNDS;
+            res.failure_detail = "Goal pose out of map bounds";
+            return res;
+        }
+
+        res.status = PlanningStatus::SUCCESS; // Valid
+        return res;
+    }
+
+    PlanningResult Planning_with_res()
+    {
+        // Step 1: Quick start/goal validation
+        PlanningResult validation = validate_start_goal(0.0, /* pass actual goal_pose from constructor or member */ Pose(goal->x,goal->y,goal->yaw)); // Assume goal_pose is a member; adjust if needed
+        if (validation.status != PlanningStatus::SUCCESS)
+        {
+            return validation;
+        }
+
+        using PQElem = std::tuple<double, uint64_t, Node *>;
+        auto cmp = [](const PQElem &a, const PQElem &b)
+        { return std::get<0>(a) > std::get<0>(b) || (std::get<0>(a) == std::get<0>(b) && std::get<1>(a) > std::get<1>(b)); };
+        std::priority_queue<PQElem, std::vector<PQElem>, decltype(cmp)> open_set(cmp);
+        uint64_t node_id = 0;
+        size_t start_id = calc_grid_index(start.get());
+        std::unordered_map<size_t, double> g_costs;
+        g_costs[start_id] = 0.0;
+        open_set.emplace(calc_f(start.get()), node_id++, start.get());
+        std::unordered_set<size_t> closed_set;
+
+        size_t iteration = 0; // for debug
+        while (!open_set.empty())
+        {
+            iteration++;
+            if (iteration % 1000 == 0)
+            {
+                std::cout << "A* iteration: " << iteration << ", open_set size: " << open_set.size()
+                          << ", current f-cost: " << std::get<0>(open_set.top()) << std::endl;
+            }
+
+            auto [f, _, current] = open_set.top();
+            open_set.pop();
+
+            size_t n_id = calc_grid_index(current);
+            if (closed_set.count(n_id))
+                continue;
+            if (current->cost > g_costs[n_id])
+                continue; // Outdated entry
+            closed_set.insert(n_id);
+
+            // for debug
+            if (iteration % 5000 == 0)
+            {
+                std::cout << "  Current node: t=" << current->t << ", x=" << current->x << ", y=" << current->y << ", yaw=" << current->yaw
+                          << ", cost=" << current->cost << std::endl;
+            }
+
+            if (!check_collision_at(current))
+                continue;
+
+            auto [rs_path, rs_length] = analytic_expand(current);
+            if (!rs_path.empty())
+            {
+                if (check_collision_along_rs(rs_path, current->t))
+                {
+                    auto waypoints = extract_path(current, rs_path);
+                    double arrival_t = waypoints.back().time;
+
+                    // Post-arrival check
+                    bool post_safe = true;
+                    for (double future_t = arrival_t + params.time_step; future_t <= params.max_time; future_t += params.time_step)
+                    {
+                        Node dummy(goal->x, goal->y, goal->yaw, future_t, 0.0, 0.0, nullptr, 0);
+                        if (!check_collision_at(&dummy))
+                        {
+                            post_safe = false;
+                            break;
+                        }
+                    }
+
+                    if (post_safe)
+                    {
+                        std::cout << "Goal found with analytic expansion!" << std::endl;
+                        return {waypoints, PlanningStatus::SUCCESS, ""};
+                    }
+                    // Else continue searching
+                    else
+                    {
+                        std::cout << "Analytic (Reeds-Shepp) path generated but rejected due to collision or bounds violation" << std::endl;
+                    }
+                }
+            }
+
+            // Goal check (assuming near-goal threshold)
+            double dist_to_goal = std::hypot(current->x - goal->x, current->y - goal->y);
+            double dyaw_to_goal = std::fabs(mod2pi(current->yaw - goal->yaw));
+            if (dist_to_goal < params.xy_resolution && dyaw_to_goal < params.yaw_resolution)
+            {
+                auto waypoints = extract_path(current, {});
+                double arrival_t = waypoints.back().time;
+
+                bool post_safe = true;
+                for (double future_t = arrival_t + params.time_step; future_t <= params.max_time; future_t += params.time_step)
+                {
+                    Node dummy(goal->x, goal->y, goal->yaw, future_t, 0.0, 0.0, nullptr, 0);
+                    if (!check_collision_at(&dummy))
+                    {
+                        post_safe = false;
+                        break;
+                    }
+                }
+
+                if (post_safe)
+                {
+                    std::cout << "Goal found!" << std::endl;
+                    return {waypoints, PlanningStatus::SUCCESS, ""};
+                }
+                // Else continue
+            }
+
+            for (auto prim : motion_primitives)
+            {
+                Node *new_node = generate_node(current, prim);
+                if (!new_node)
+                    continue;
+                if (!check_collision_along_path(current, new_node, prim))
+                    continue;
+                size_t new_id = calc_grid_index(new_node);
+                if (closed_set.count(new_id))
+                    continue;
+                double new_g = new_node->cost;
+                auto it = g_costs.find(new_id);
+                if (it != g_costs.end() && new_g >= it->second)
+                    continue; // Worse or equal
+                g_costs[new_id] = new_g;
+                open_set.emplace(new_g + calc_heuristic(new_node), node_id++, new_node);
+            }
+        }
+
+        std::cout << "No path found" << std::endl;
+        return {};
+    }
+
+    // this version is to be deprecated
     std::vector<Waypoint> planning() {
         using PQElem = std::tuple<double, uint64_t, Node*>;
         auto cmp = [](const PQElem& a, const PQElem& b) { return std::get<0>(a) > std::get<0>(b) || (std::get<0>(a) == std::get<0>(b) && std::get<1>(a) > std::get<1>(b)); };
@@ -400,7 +598,6 @@ public:
         open_set.emplace(calc_f(start.get()), node_id++, start.get());
         std::unordered_set<size_t> closed_set;
 
-
         size_t iteration = 0; // for debug
         while (!open_set.empty()) {
             iteration++;
@@ -409,27 +606,19 @@ public:
                           << ", current f-cost: " << std::get<0>(open_set.top()) << std::endl;
             }
 
-
-
             auto [f, _, current] = open_set.top();
             open_set.pop();
-
-
-
 
             size_t n_id = calc_grid_index(current);
             if (closed_set.count(n_id)) continue;
             if (current->cost > g_costs[n_id]) continue;  // Outdated entry
             closed_set.insert(n_id);
 
-
             // for debug
             if (iteration % 5000 == 0) {
                 std::cout << "  Current node: t=" << current->t << ", x=" << current->x << ", y=" << current->y << ", yaw=" << current->yaw
                           << ", cost=" << current->cost << std::endl;
             }
-
-
 
             if (!check_collision_at(current)) continue;
 
@@ -530,6 +719,10 @@ std::vector<Trajectory> perform_planning(
         auto start_time = std::chrono::high_resolution_clock::now();
         auto waypoints = planner.planning();
         auto end_time = std::chrono::high_resolution_clock::now();
+        // Fix double time offset: make waypoint times relative to trajectory start
+        for (auto& wp : waypoints) {
+            wp.time -= current_start_t;
+        }
         std::chrono::duration<double> planning_time = end_time - start_time;
         std::cout << "Planning time for " << r_name << ": " << planning_time.count() << " seconds" << std::endl;
 
@@ -552,7 +745,7 @@ std::vector<Trajectory> perform_planning(
             timetable.add_trajectory(traj);
 
             // Update for potential next plan for this robot
-            robot_current_times[r_name] = waypoints.back().time;
+            robot_current_times[r_name] = current_start_t + waypoints.back().time;
             robot_current_poses[r_name] = {waypoints.back().x, waypoints.back().y, waypoints.back().yaw};
         } else {
             std::cout << "Failed to find a path for " << r_name << std::endl;
