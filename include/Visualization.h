@@ -17,7 +17,7 @@
 #include <QDockWidget>
 #include <QHBoxLayout>
 #include <QLabel>
-
+#include <QDialog>
 #include <vector>
 
 #include <Point.h>
@@ -297,5 +297,187 @@ void show_results(int argc, char** argv, const TimeTable& timetable, const std::
     app.exec();
 }
 
+// In Visualization.h or a new DebugViz.h (include <QWidget>, <QPainter>, <QApplication>, <QDialog> if not already)
+class DebugVisualizer : public QDialog {
+public:
+    DebugVisualizer(const TimeTable& timetable, const std::unordered_map<std::string, EntityMeta*>& entities,
+                    const Params& params, double query_time,
+                    const Pose& start_pose = {}, const Pose& goal_pose = {}, QWidget* parent = nullptr)
+        : QDialog(parent), timetable_(timetable), entities_(entities), params_(params),
+        query_time_(query_time), start_pose_(start_pose), goal_pose_(goal_pose) {
+        setWindowTitle(QString("Debug State at t=%1").arg(query_time));
+        resize(800, 600);  // Adjust as needed
+
+        // Debug print: Check entities
+        qDebug() << "Debug Viz: " << entities_.size() << " entities at t=" << query_time;
+        for (const auto& [name, ent] : entities_) {
+            Pose p = timetable_.get_pose(ent, query_time_);
+            qDebug() << " - " << QString::fromStdString(name) << ": (" << p.x << ", " << p.y << ", yaw=" << p.yaw << ")";
+        }
+    }
+
+protected:
+    void paintEvent(QPaintEvent* event) override {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+
+        // Compute scale (fit workspace to window)
+        double w = params_.max_x - params_.min_x;
+        double h = params_.max_y - params_.min_y;
+        double scale_x = (width() - 100) / w;  // Add margins
+        double scale_y = (height() - 100) / h;
+        double scale = std::min(scale_x, scale_y);
+        qDebug() << "Scale:" << scale << "Workspace:" << w << "x" << h;
+
+        // Save original state
+        painter.save();
+
+        // Apply transform for world coords
+        painter.translate(50, height() - 50);  // Bottom-left origin with margin
+        painter.scale(scale, -scale);  // Flip Y, scale
+
+        // Draw bounds (with fixed device pen)
+        painter.restore();  // Draw boundary in device coords for visibility
+        painter.setPen(QPen(Qt::black, 2));  // Fixed 2px width
+        double dev_min_x = 50;
+        double dev_min_y = 50;
+        double dev_w = w * scale;
+        double dev_h = h * scale;
+        painter.drawRect(QRectF(dev_min_x, dev_min_y, dev_w, dev_h));
+        painter.save();  // Re-apply transform for world drawing
+        painter.translate(50, height() - 50);
+        painter.scale(scale, -scale);
+
+        // Pre-compute poses and corners for all entities
+        std::unordered_map<std::string, Pose> poses;
+        std::unordered_map<std::string, Corners> all_corners;
+        for (const auto& [name, ent] : entities_) {
+            Pose p = timetable_.get_pose(ent, query_time_);
+            poses[name] = p;
+            Corners corners = get_corners(p.x, p.y, p.yaw, ent->size.front_length, ent->size.rear_length, ent->size.width);
+            all_corners[name] = corners;
+        }
+
+        // Detect collisions: Check pairwise intersections
+        std::vector<std::pair<std::string, std::string>> collisions;
+        auto entity_names = std::vector<std::string>{};
+        for (const auto& [name, ent] : entities_) entity_names.push_back(name);
+        for (size_t i = 0; i < entity_names.size(); ++i) {
+            for (size_t j = i + 1; j < entity_names.size(); ++j) {
+                const auto& name1 = entity_names[i];
+                const auto& name2 = entity_names[j];
+                if (rectangles_intersect(all_corners.at(name1), all_corners.at(name2))) {
+                    collisions.emplace_back(name1, name2);
+                    qDebug() << "Collision detected between" << QString::fromStdString(name1) << "and" << QString::fromStdString(name2);
+                }
+            }
+        }
+
+        // Draw entities (scaled)
+        for (const auto& [name, ent] : entities_) {
+            QColor color = (ent->type == EntityType::ROBOT) ? Qt::blue : Qt::green;
+            painter.setBrush(color);
+            painter.setPen(QPen(Qt::black, 0.02));  // Fixed small world-space width (adjust if needed)
+
+            // Get corners and draw polygon
+            const Corners& corners = all_corners.at(name);
+            QPolygonF poly;
+            for (const auto& c : corners) {
+                poly << QPointF(c.x, c.y);
+            }
+            painter.drawPolygon(poly);
+        }
+
+        // Highlight collisions (red overlay or outline)
+        painter.setPen(QPen(Qt::red, 0.05, Qt::SolidLine));
+        painter.setBrush(QBrush(QColor(255, 0, 0, 50)));  // Semi-transparent red
+        for (const auto& [name1, name2] : collisions) {
+            // Draw outlines around colliding pairs
+            QPolygonF poly1, poly2;
+            for (const auto& c : all_corners.at(name1)) poly1 << QPointF(c.x, c.y);
+            for (const auto& c : all_corners.at(name2)) poly2 << QPointF(c.x, c.y);
+            painter.drawPolygon(poly1);
+            painter.drawPolygon(poly2);
+            // Optional: Draw intersection area if needed (advanced: compute clip, but skip for simplicity)
+        }
+
+        // Draw start/goal (scaled)
+        painter.setPen(QPen(Qt::black, 0.02));
+        if (start_pose_.x != 0 || start_pose_.y != 0) {
+            painter.setBrush(Qt::yellow);
+            painter.drawEllipse(QPointF(start_pose_.x, start_pose_.y), 0.1, 0.1);
+        }
+        if (goal_pose_.x != 0 || goal_pose_.y != 0) {
+            painter.setBrush(Qt::red);
+            painter.drawEllipse(QPointF(goal_pose_.x, goal_pose_.y), 0.1, 0.1);
+            if (start_pose_.x != 0 || start_pose_.y != 0) {
+                painter.setPen(QPen(Qt::red, 0.05, Qt::DashLine));
+                painter.drawLine(QPointF(start_pose_.x, start_pose_.y), QPointF(goal_pose_.x, goal_pose_.y));
+            }
+        }
+
+        // Future overlays (scaled, semi-transparent)
+        painter.setOpacity(0.3);
+        for (double dt = 5.0; dt <= 15.0; dt += 5.0) {
+            for (const auto& [name, ent] : entities_) {
+                if (ent->type != EntityType::ROBOT) continue;
+                Pose p_future = timetable_.get_pose(ent, query_time_ + dt);
+                painter.setBrush(Qt::gray);
+                painter.setPen(QPen(Qt::black, 0.02));
+                Corners corners = get_corners(p_future.x, p_future.y, p_future.yaw,
+                                              ent->size.front_length, ent->size.rear_length, ent->size.width);
+                QPolygonF poly;
+                for (const auto& c : corners) poly << QPointF(c.x, c.y);
+                painter.drawPolygon(poly);
+            }
+        }
+        painter.setOpacity(1.0);
+
+        // Restore for unscaled drawing (e.g., labels)
+        painter.restore();
+
+        // Draw labels in device coordinates (unscaled)
+        QFont font = painter.font();
+        font.setPointSize(10);  // Fixed small size
+        painter.setFont(font);
+        painter.setPen(Qt::black);
+        for (const auto& [name, ent] : entities_) {
+            Pose p = timetable_.get_pose(ent, query_time_);
+            // World to device
+            double dev_x = 50 + (p.x - params_.min_x) * scale;
+            double dev_y = 50 + (params_.max_y - p.y) * scale;  // Adjust for flipped Y (since bottom is max_y after flip?)
+            painter.drawText(QPointF(dev_x, dev_y + 10), QString::fromStdString(name));  // Pixel offset
+        }
+    }
+
+private:
+    const TimeTable& timetable_;
+    const std::unordered_map<std::string, EntityMeta*>& entities_;
+    const Params& params_;
+    double query_time_;
+    Pose start_pose_;
+    Pose goal_pose_;
+};
+
+// The visualize_current_state function remains the same
+void visualize_current_state(const TimeTable& timetable, const std::unordered_map<std::string, EntityMeta*>& entities,
+                             const Params& params, double query_time,
+                             const Pose& start_pose = {}, const Pose& goal_pose = {}) {
+    QApplication* app = qobject_cast<QApplication*>(QCoreApplication::instance());
+    bool own_app = false;
+    if (!app) {
+        static int local_argc = 1;
+        static char* local_argv[] = {const_cast<char*>("debug_viz")};
+        app = new QApplication(local_argc, local_argv);
+        own_app = true;
+    }
+
+    DebugVisualizer viz(timetable, entities, params, query_time, start_pose, goal_pose);
+    viz.exec();  // Blocks until closed
+
+    if (own_app) {
+        delete app;
+    }
+}
 
 #endif // VISUALIZATION_H
