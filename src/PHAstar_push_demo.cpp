@@ -204,10 +204,12 @@ bool plan_initial_transit(RobotMeta* robot, const Pose& target_pose, double star
               << target_pose.x << ", " << target_pose.y << ") starting at " << start_time << "s" << std::endl;
 
     PHAStar planner(robot, target_pose, &timetable, &entities, params, false, "", start_time);
-    auto path_res = planner.Planning_with_res();
+    auto path_res = planner.Planning_with_res(start_time);
 
     if (path_res.waypoints.empty()) {
         std::cerr << "  [Error] Transit planning failed for " << robot->name << std::endl;
+
+
 
         // Call the new diagnostic tool
         diagnose_planning_failure(robot, current_pose, target_pose, start_time, timetable);

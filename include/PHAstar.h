@@ -453,10 +453,10 @@ public:
         return res;
     }
 
-    PlanningResult Planning_with_res()
+    PlanningResult Planning_with_res(double check_time = 0.0)
     {
         // Step 1: Quick start/goal validation
-        PlanningResult validation = validate_start_goal(0.0, /* pass actual goal_pose from constructor or member */ Pose(goal->x,goal->y,goal->yaw)); // Assume goal_pose is a member; adjust if needed
+        PlanningResult validation = validate_start_goal(check_time, /* pass actual goal_pose from constructor or member */ Pose(goal->x,goal->y,goal->yaw)); // Assume goal_pose is a member; adjust if needed
         if (validation.status != PlanningStatus::SUCCESS)
         {
             return validation;
@@ -483,8 +483,13 @@ public:
                           << ", current f-cost: " << std::get<0>(open_set.top()) << std::endl;
             }
 
+
             auto [f, _, current] = open_set.top();
             open_set.pop();
+
+            // for debug
+            //std::cout << "DEBUG_VISITED," << current->x << "," << current->y << ","
+             //         << current->yaw << "," << current->t << "," << current->cost << std::endl;
 
             size_t n_id = calc_grid_index(current);
             if (closed_set.count(n_id))
@@ -533,6 +538,11 @@ public:
                     {
                         std::cout << "Analytic (Reeds-Shepp) path generated but rejected due to collision or bounds violation" << std::endl;
                     }
+                }
+                else
+                {
+                    //std::cout << "DEBUG_RS_FAIL: RS Path collided! Dist=" << std::hypot(current->x - goal->x, current->y - goal->y)
+                     //         << " NodeT=" << current->t << std::endl;
                 }
             }
 
