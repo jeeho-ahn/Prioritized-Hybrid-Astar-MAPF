@@ -26,6 +26,7 @@ Params initialize_params(const std::vector<FinalAllocation>& loadedSequence) {
     Params params;
     // Set analytic expansion threshold
     params.analytic_threshold = 5.0 * params.max_steer;
+    //params.analytic_threshold = std::hypot(params.max_x - params.min_x, params.max_y - params.min_y) * 2.0;
 
     // Set workspace boundaries if available
     if (!loadedSequence.empty()) {
@@ -48,7 +49,7 @@ std::unordered_map<std::string, EntityMeta*> initialize_entities(const std::vect
     robot1->name = "robot1";
     robot1->type = EntityType::ROBOT;
     robot1->initial_pose = {0.5, 0.45, 0.0};
-    robot1->size.front_length = 0.3;
+    robot1->size.front_length = 0.32;
     robot1->size.rear_length = 0.2;
     robot1->size.width = 0.3;
     robot1->min_turning_radius = 1.0;
@@ -62,7 +63,7 @@ std::unordered_map<std::string, EntityMeta*> initialize_entities(const std::vect
     robot2->name = "robot2";
     robot2->type = EntityType::ROBOT;
     robot2->initial_pose = {0.5, 4.0, 0.0};
-    robot2->size.front_length = 0.3;
+    robot2->size.front_length = 0.32;
     robot2->size.rear_length = 0.2;
     robot2->size.width = 0.3;
     robot2->min_turning_radius = 1.0;
@@ -201,20 +202,22 @@ bool plan_initial_transit(RobotMeta* robot, const Pose& target_pose, double star
     robot->initial_pose = current_pose; // Update meta for planner
 
     std::cout << "  [Transit] Planning " << robot->name << " -> ("
-              << target_pose.x << ", " << target_pose.y << ") starting at " << start_time << "s" << std::endl;
+              << target_pose.x << ", " << target_pose.y << ", " << target_pose.yaw << ") starting at " << start_time << "s" << std::endl;
 
     PHAStar planner(robot, target_pose, &timetable, &entities, params, false, "", start_time);
     auto path_res = planner.Planning_with_res(start_time);
 
     if (path_res.waypoints.empty()) {
-        std::cerr << "  [Error] Transit planning failed for " << robot->name << std::endl;
-
+        //std::cerr << "  [Error] Transit planning failed for " << robot->name << std::endl;
+        std::cerr << " [Error] Transit planning failed for " << robot->name
+                  << " - Status: " << static_cast<int>(path_res.status) << ", Detail: " << path_res.failure_detail << std::endl;
 
 
         // Call the new diagnostic tool
         diagnose_planning_failure(robot, current_pose, target_pose, start_time, timetable);
         if (DEBUG_VIS) {  // Assuming you keep a global DEBUG_VIS toggle
             visualize_current_state(timetable, entities, params, start_time, current_pose, target_pose);
+            visualize_search_tree(path_res.explored_nodes, params);
         }
 
         return false;

@@ -20,6 +20,7 @@
 #include <QDialog>
 #include <vector>
 
+#include <Node.h>
 #include <Point.h>
 #include <Entities.h>
 #include <Params.h>
@@ -479,5 +480,75 @@ void visualize_current_state(const TimeTable& timetable, const std::unordered_ma
         delete app;
     }
 }
+
+class SearchTreeViz : public QDialog {
+public:
+    SearchTreeViz(const std::vector<Node>& nodes, const Params& params, QWidget* parent = nullptr)
+        : QDialog(parent), nodes_(nodes), params_(params) {
+        setWindowTitle("PHA* Search Tree Debug");
+        resize(800, 600);
+
+        // Debug log
+        qDebug() << "Search Tree Viz: " << nodes.size() << " nodes";
+    }
+
+protected:
+    void paintEvent(QPaintEvent* event) override {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+
+        // Compute scale (same as DebugVisualizer)
+        double w = params_.max_x - params_.min_x;
+        double h = params_.max_y - params_.min_y;
+        double scale_x = (width() - 100) / w;
+        double scale_y = (height() - 100) / h;
+        double scale = std::min(scale_x, scale_y);
+
+        painter.translate(50, height() - 50);  // Bottom-left origin
+        painter.scale(scale, -scale);  // Flip Y
+
+        // Draw bounds
+        painter.setPen(QPen(Qt::black, 2.0 / scale));  // Visible width
+        painter.drawRect(QRectF(params_.min_x, params_.min_y, w, h));
+
+        // Draw tree: edges first (lines to parent), then nodes (dots)
+        painter.setPen(QPen(Qt::black, 0.01));  // Thin lines
+        for (const auto& node : nodes_) {
+            if (node.parent) {
+                painter.drawLine(QPointF(node.x, node.y), QPointF(node.parent->x, node.parent->y));
+            }
+        }
+
+        // Nodes as small cyan dots
+        painter.setBrush(Qt::cyan);
+        painter.setPen(Qt::NoPen);  // No outline for dots
+        for (const auto& node : nodes_) {
+            painter.drawEllipse(QPointF(node.x, node.y), 0.05, 0.05);  // Small radius
+        }
+    }
+
+private:
+    const std::vector<Node>& nodes_;
+    const Params& params_;
+};
+
+void visualize_search_tree(const std::vector<Node>& nodes, const Params& params) {
+    QApplication* app = qobject_cast<QApplication*>(QCoreApplication::instance());
+    bool own_app = false;
+    if (!app) {
+        static int local_argc = 1;
+        static char* local_argv[] = {const_cast<char*>("search_viz")};
+        app = new QApplication(local_argc, local_argv);
+        own_app = true;
+    }
+
+    SearchTreeViz viz(nodes, params);
+    viz.exec();  // Blocks until closed
+
+    if (own_app) {
+        delete app;
+    }
+}
+
 
 #endif // VISUALIZATION_H

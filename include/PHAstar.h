@@ -8,6 +8,7 @@
 #ifndef PHASTAR_H
 #define PHASTAR_H
 
+#include <Node.h>
 #include <Point.h>
 #include <Entities.h>
 #include <Params.h>
@@ -36,6 +37,7 @@ struct PlanningResult
     std::string failure_detail = "";   // Human-readable message
     std::string colliding_entity = ""; // Name of entity causing collision (if applicable)
     double failure_time = 0.0;         // Timestamp where collision/failure occurred (if relevant)
+    std::vector<Node> explored_nodes;
 };
 
 bool is_in_bounds(const Corners& corners, double min_x, double max_x, double min_y, double max_y) {
@@ -48,7 +50,7 @@ bool is_in_bounds(const Corners& corners, double min_x, double max_x, double min
     return true;
 }
 
-
+/*
 struct Node {
     double x, y, yaw, t, cost, steer;
     Node* parent;
@@ -57,6 +59,7 @@ struct Node {
         : x(x_), y(y_), yaw(yaw_), t(t_), cost(cost_), steer(steer_), parent(p), direction(dir) {}
 
 };
+*/
 
 class PHAStar {
 private:
@@ -455,12 +458,15 @@ public:
 
     PlanningResult Planning_with_res(double check_time = 0.0)
     {
+        PlanningResult res;
         // Step 1: Quick start/goal validation
         PlanningResult validation = validate_start_goal(check_time, /* pass actual goal_pose from constructor or member */ Pose(goal->x,goal->y,goal->yaw)); // Assume goal_pose is a member; adjust if needed
         if (validation.status != PlanningStatus::SUCCESS)
         {
             return validation;
         }
+
+        std::vector<Node> local_explored; // for debug
 
         using PQElem = std::tuple<double, uint64_t, Node *>;
         auto cmp = [](const PQElem &a, const PQElem &b)
@@ -486,6 +492,8 @@ public:
 
             auto [f, _, current] = open_set.top();
             open_set.pop();
+            // for debug
+            local_explored.push_back(*current);
 
             // for debug
             //std::cout << "DEBUG_VISITED," << current->x << "," << current->y << ","
@@ -568,7 +576,10 @@ public:
                 if (post_safe)
                 {
                     std::cout << "Goal found!" << std::endl;
-                    return {waypoints, PlanningStatus::SUCCESS, ""};
+                    //return {waypoints, PlanningStatus::SUCCESS, ""};
+                    res.waypoints = waypoints;
+                    res.status = PlanningStatus::SUCCESS;
+                    return res;
                 }
                 // Else continue
             }
@@ -593,7 +604,11 @@ public:
         }
 
         std::cout << "No path found" << std::endl;
-        return {};
+        res.status = PlanningStatus::NO_PATH_FOUND;
+        res.failure_detail = "Search exhausted without reaching goal.";
+        res.explored_nodes = std::move(local_explored);  // Move to result on failure
+        //return {};
+        return res;
     }
 
     // this version is to be deprecated
