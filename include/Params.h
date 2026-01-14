@@ -17,7 +17,7 @@ struct Params {
     double reverse_penalty = 50.0;
     double switch_penalty = 1.2;
     double wait_penalty = 10.0;
-    double max_time = 700.0;
+    double max_time = 1000.0;
     int collision_steps = 3;
     double analytic_threshold = 5.0;
     double rs_step_size = 0.2;

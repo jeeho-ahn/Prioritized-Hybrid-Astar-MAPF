@@ -63,7 +63,7 @@ std::unordered_map<std::string, EntityMeta*> initialize_entities(const std::vect
     RobotMeta* robot2 = new RobotMeta;
     robot2->name = "robot2";
     robot2->type = EntityType::ROBOT;
-    robot2->initial_pose = {0.5, 4.0, 0.0};
+    robot2->initial_pose = {0.5, 3.0, 0.0};
     robot2->size.front_length = 0.32;
     robot2->size.rear_length = 0.2;
     robot2->size.width = 0.3;
@@ -529,7 +529,7 @@ void process_task_execution(RobotMeta* robot, Task& task, TimeTable& timetable,
 
 int main(int argc, char** argv) {
     // --- 1. Load Data ---
-    std::string filename = std::string(CMAKE_SOURCE_DIR) + "/test_sequence_o8.b64";
+    std::string filename = std::string(CMAKE_SOURCE_DIR) + "/final_sequence_o13_iros_obj13_v2.txt.b64";
     std::cout << "[System] Loading sequence: " << filename << std::endl;
 
     std::vector<FinalAllocation> loadedSequence = loadFinalSequenceFromFile(filename);

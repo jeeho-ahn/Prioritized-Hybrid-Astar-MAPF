@@ -310,10 +310,10 @@ public:
         resize(800, 600);  // Adjust as needed
 
         // Debug print: Check entities
-        qDebug() << "Debug Viz: " << entities_.size() << " entities at t=" << query_time;
+       // qDebug() << "Debug Viz: " << entities_.size() << " entities at t=" << query_time;
         for (const auto& [name, ent] : entities_) {
             Pose p = timetable_.get_pose(ent, query_time_);
-            qDebug() << " - " << QString::fromStdString(name) << ": (" << p.x << ", " << p.y << ", yaw=" << p.yaw << ")";
+        //    qDebug() << " - " << QString::fromStdString(name) << ": (" << p.x << ", " << p.y << ", yaw=" << p.yaw << ")";
         }
     }
 
@@ -328,7 +328,7 @@ protected:
         double scale_x = (width() - 100) / w;  // Add margins
         double scale_y = (height() - 100) / h;
         double scale = std::min(scale_x, scale_y);
-        qDebug() << "Scale:" << scale << "Workspace:" << w << "x" << h;
+       // qDebug() << "Scale:" << scale << "Workspace:" << w << "x" << h;
 
         // Save original state
         painter.save();
@@ -369,7 +369,7 @@ protected:
                 const auto& name2 = entity_names[j];
                 if (rectangles_intersect(all_corners.at(name1), all_corners.at(name2))) {
                     collisions.emplace_back(name1, name2);
-                    qDebug() << "Collision detected between" << QString::fromStdString(name1) << "and" << QString::fromStdString(name2);
+              //      qDebug() << "Collision detected between" << QString::fromStdString(name1) << "and" << QString::fromStdString(name2);
                 }
             }
         }
@@ -489,7 +489,7 @@ public:
         resize(800, 600);
 
         // Debug log
-        qDebug() << "Search Tree Viz: " << nodes.size() << " nodes";
+      //  qDebug() << "Search Tree Viz: " << nodes.size() << " nodes";
     }
 
 protected:
