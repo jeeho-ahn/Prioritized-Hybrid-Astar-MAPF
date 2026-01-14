@@ -94,7 +94,7 @@ public:
             }
         }
     }
-
+/*
     Pose calcRobotPoseFromObj(const Pose& pose_in) {
         if (!assignedRobot || !targetObject) {
             std::cerr << "Assigned robot or target object not set." << std::endl;
@@ -120,6 +120,7 @@ public:
         attached.y -= extra_offset * std::sin(attached.yaw);
         return attached;
     }
+*/
 };
 
 #endif // TASK_H

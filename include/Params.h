@@ -17,13 +17,15 @@ struct Params {
     double reverse_penalty = 50.0;
     double switch_penalty = 1.2;
     double wait_penalty = 10.0;
-    double max_time = 300.0;
+    double max_time = 700.0;
     int collision_steps = 3;
     double analytic_threshold = 5.0;
     double rs_step_size = 0.2;
     double inflation = 1.1;
     double safety_margin = 0.01;
     double movement_length = 0.0;  // Added back for dynamic calculation
+
+    double final_push_distance = 0.025;
 };
 
 #endif // PARAMS_H

@@ -69,5 +69,25 @@ bool rectangles_intersect(const Corners& corners1, const Corners& corners2) {
     return true;
 }
 
+struct Pose : public Point {
+    double yaw = 0.0;
+
+    Pose(){}
+
+    Pose(double x_in, double y_in, double yaw_in) : yaw(yaw_in)
+    {
+        x = x_in;
+        y = y_in;
+    }
+};
+
+Pose offsetPose(Pose& pose_in, double offset_dist)
+{
+    double op_x = pose_in.x + offset_dist * std::cos(pose_in.yaw);
+    double op_y = pose_in.y + offset_dist * std::sin(pose_in.yaw);
+
+    return Pose(op_x,op_y,pose_in.yaw);
+}
+
 
 #endif // POINT_H

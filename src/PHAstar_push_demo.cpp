@@ -52,13 +52,14 @@ std::unordered_map<std::string, EntityMeta*> initialize_entities(const std::vect
     robot1->size.front_length = 0.32;
     robot1->size.rear_length = 0.2;
     robot1->size.width = 0.3;
-    robot1->min_turning_radius = 1.0;
+    robot1->min_turning_radius = 1.43;
     robot1->wheel_base = 0.4;
     robot1->speed_transit = 0.2;
     robot1->speed_transfer = 0.15;
     entities["robot1"] = robot1;
 
     // Robot 2
+
     RobotMeta* robot2 = new RobotMeta;
     robot2->name = "robot2";
     robot2->type = EntityType::ROBOT;
@@ -66,11 +67,28 @@ std::unordered_map<std::string, EntityMeta*> initialize_entities(const std::vect
     robot2->size.front_length = 0.32;
     robot2->size.rear_length = 0.2;
     robot2->size.width = 0.3;
-    robot2->min_turning_radius = 1.0;
+    robot2->min_turning_radius = 1.43;
     robot2->wheel_base = 0.4;
     robot2->speed_transit = 0.2;
     robot2->speed_transfer = 0.15;
     entities["robot2"] = robot2;
+
+    /*
+    RobotMeta* robot3 = new RobotMeta;
+    robot3->name = "robot3";
+    robot3->type = EntityType::ROBOT;
+    robot3->initial_pose = {0.5, 1.8, 0.0};
+    robot3->size.front_length = 0.32;
+    robot3->size.rear_length = 0.2;
+    robot3->size.width = 0.3;
+    robot3->min_turning_radius = 1.43;
+    robot3->wheel_base = 0.4;
+    robot3->speed_transit = 0.2;
+    robot3->speed_transfer = 0.15;
+    entities["robot3"] = robot3;
+*/
+
+
 
     // Parse Objects
     if (!loadedSequence.empty()) {
@@ -222,6 +240,14 @@ bool plan_initial_transit(RobotMeta* robot, const Pose& target_pose, double star
 
         return false;
     }
+
+    // add final push
+    double delta_t = params.final_push_distance / robot->speed_transit;
+    auto final_push_pose = offsetPose(path_res.waypoints.back(),params.final_push_distance);
+    auto final_push_wpt = Waypoint(final_push_pose);
+    final_push_wpt.time = path_res.waypoints.back().time+delta_t;
+    final_push_wpt.linear_velocity = path_res.waypoints.back().linear_velocity;
+    path_res.waypoints.push_back(final_push_wpt);
 
     // Adjust relative time and register
     for (auto& wp : path_res.waypoints) wp.time -= start_time;

@@ -744,6 +744,16 @@ std::vector<Trajectory> perform_planning(
         auto start_time = std::chrono::high_resolution_clock::now();
         auto waypoints = planner.planning();
         auto end_time = std::chrono::high_resolution_clock::now();
+
+        // add final push
+        double delta_t = params.final_push_distance / r->speed_transit;
+        auto final_push_pose = offsetPose(waypoints.back(),params.final_push_distance);
+        auto final_push_wpt = Waypoint(final_push_pose);
+        final_push_wpt.time = waypoints.back().time+delta_t;
+        final_push_wpt.linear_velocity = waypoints.back().linear_velocity;
+        waypoints.push_back(final_push_wpt);
+
+
         // Fix double time offset: make waypoint times relative to trajectory start
         for (auto& wp : waypoints) {
             wp.time -= current_start_t;

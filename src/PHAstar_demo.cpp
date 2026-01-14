@@ -63,9 +63,10 @@ std::unordered_map<std::string, EntityMeta*> initialize_entities() {
 std::vector<std::tuple<std::string, Pose, bool, std::string, double>> initialize_plans() {
     return {
         //{"robot1", {4.0, 4.0, M_PI / 2}, false, "", 0.0}, // agent name, goal pose, is it transferring item, ignore collision with, starting time
-        {"robot1", {4.82, 2, M_PI / 2}, false, "", 0.0}, // testing close to the edge
+        {"robot1", {4.2, 4.2, M_PI / 2}, false, "", 0.0}, // testing close to the edge
         {"robot2", {4.5, 1.0, M_PI / 2}, false, "", 0.0},
-        {"robot2", {2.0, 3.0, 0.0}, false, "", 39.0}
+        {"robot1", {3, 2, M_PI}, false, "", 29.0},
+        {"robot2", {2.0, 3.0, 0.0}, false, "", 32.0}
     };
 }
 
