@@ -22,4 +22,5 @@ inline double pi_2_pi(double angle) {
     return angle;
 }
 
+
 #endif // UTILS_H

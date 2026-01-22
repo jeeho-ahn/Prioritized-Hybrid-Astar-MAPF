@@ -59,7 +59,7 @@ std::unordered_map<std::string, EntityMeta*> initialize_entities(const std::vect
     entities["robot1"] = robot1;
 
     // Robot 2
-
+/*
     RobotMeta* robot2 = new RobotMeta;
     robot2->name = "robot2";
     robot2->type = EntityType::ROBOT;
@@ -72,7 +72,7 @@ std::unordered_map<std::string, EntityMeta*> initialize_entities(const std::vect
     robot2->speed_transit = 0.2;
     robot2->speed_transfer = 0.15;
     entities["robot2"] = robot2;
-
+*/
     /*
     RobotMeta* robot3 = new RobotMeta;
     robot3->name = "robot3";
@@ -105,6 +105,15 @@ std::unordered_map<std::string, EntityMeta*> initialize_entities(const std::vect
         }
     }
     return entities;
+}
+
+Pose calcRobotPoseFromObj(const Pose& obj_pose, const OccuRect& robot_size, const OccuRect& obj_size) {
+    double offset = robot_size.front_length + obj_size.rear_length + 0.1 + 0.05;
+    Pose robot_pose;
+    robot_pose.x = obj_pose.x - offset * std::cos(obj_pose.yaw);
+    robot_pose.y = obj_pose.y - offset * std::sin(obj_pose.yaw);
+    robot_pose.yaw = obj_pose.yaw;
+    return robot_pose;
 }
 
 // --- Collision & Blocking Checkers (Preserved from original) ---
@@ -327,15 +336,141 @@ bool check_collision_trajectory(const Trajectory& traj, double start_time, TimeT
 // Moves a blocking robot out of the way (Original Logic)
 bool resolve_goal_blocking(RobotMeta* robot_to_plan, const Pose& desired_goal, TimeTable& timetable,
                            const std::unordered_map<std::string, EntityMeta*>& entities, const Params& params,
-                           double current_time, bool check_trajectory_blocking, const std::vector<TrajectoryPtr>& traj_ptrs)
+                           double current_time, bool check_trajectory_blocking, const TrajectoryPtr& traj_ptr)
 {
-    // ... [Original resolve_goal_blocking implementation] ...
-    // Note: The original function signature took a vector for trajectory pointers in some versions,
-    // or a single one. Adapted here to match the call in main.
+    constexpr double BLOCK_DIST_THRESHOLD   = 0.90;   // [m] if anyone is closer than this → blocking
+    constexpr double BLOCK_YAW_THRESHOLD    = M_PI_2; // 90° yaw tolerance
+    constexpr double STATIONARY_THRESHOLD   = 0.20;   // moved <20 cm in 4 seconds → considered waiting
+    constexpr double LOOKAHEAD_TIME         = 4.0;    // seconds
+    constexpr double TRAJ_SAMPLE_STEP       = 0.5;    // [m] sample every 50cm along trajectory for blocks
+    constexpr double TRAJ_BLOCK_DIST        = 0.60;   // [m] closer than this to traj point → blocking along path
 
-    // (Paste the body of resolve_goal_blocking from the prompt here)
-    // Return true if any evasion was planned.
-    return false; // Placeholder for compilation if logic not pasted
+    bool cleared_any = false;
+
+    // ---- PART 1: Check goal blocking (always on) ----
+    for (const auto& [name, ent] : entities) {
+        if (ent->type != EntityType::ROBOT || ent == robot_to_plan) continue;
+        RobotMeta* blocker = dynamic_cast<RobotMeta*>(ent);
+
+        Pose now_pose = timetable.get_pose(blocker, current_time);
+        Pose future_pose = timetable.get_pose(blocker, current_time + LOOKAHEAD_TIME);
+
+        double dist_to_goal = std::hypot(now_pose.x - desired_goal.x, now_pose.y - desired_goal.y);
+        double yaw_diff = std::abs(pi_2_pi(now_pose.yaw - desired_goal.yaw));
+        double moved = std::hypot(future_pose.x - now_pose.x, future_pose.y - now_pose.y);
+
+        if (dist_to_goal < BLOCK_DIST_THRESHOLD &&
+            yaw_diff < BLOCK_YAW_THRESHOLD &&
+            moved < STATIONARY_THRESHOLD)
+        {
+            std::cout << "[GOAL BLOCK] " << blocker->name << " is parked at the goal of "
+                      << robot_to_plan->name << " (dist=" << dist_to_goal << "m). Forcing it to move aside.\n";
+
+            // Generate evasive goal (left first, then right)
+            std::vector<double> directions = { now_pose.yaw + M_PI_2, now_pose.yaw - M_PI_2 };
+            bool cleared = false;
+
+            for (double dir : directions) {
+                Pose evade_goal = now_pose;
+                evade_goal.x += 1.5 * std::cos(dir);
+                evade_goal.y += 1.5 * std::sin(dir);
+
+                PHAStar evader(blocker, evade_goal, &timetable, &entities, params, false, "", current_time);
+                auto evade_path = evader.Planning_with_res();
+
+                if (!evade_path.waypoints.empty()) {
+                    for (auto& wp : evade_path.waypoints) wp.time -= current_time; // relative
+
+                    Trajectory evade_traj;
+                    evade_traj.entity = blocker;
+                    evade_traj.start_time = current_time;
+                    evade_traj.waypoints = evade_path.waypoints;
+                    evade_traj.is_transfer = false;
+
+                    timetable.add_trajectory(evade_traj);
+                    std::cout << "  → " << blocker->name << " moved aside from goal.\n";
+                    cleared = true;
+                    cleared_any = true;
+                    break;
+                }
+            }
+
+            if (!cleared) {
+                std::cout << "  → WARN: No evasive path for " << blocker->name << " from goal block.\n";
+            }
+        }
+    }
+
+    // ---- PART 2: Check trajectory blocking (optional) ----
+    if (check_trajectory_blocking && traj_ptr!=nullptr) {
+        std::cout << "[TRAJ BLOCK CHECK] Scanning preplanned paths for blockers...\n";
+
+        //     if (!traj_ptr || traj_ptr->waypoints.empty())
+
+        const auto& waypoints = traj_ptr->waypoints;
+        double traj_duration = waypoints.back().time;
+
+        // Sample points along the trajectory (relative time)
+        for (double rel_t = 0.0; rel_t <= traj_duration; rel_t += TRAJ_SAMPLE_STEP) {
+            Pose traj_point = TimeTable::interpolate_waypoints(waypoints, rel_t);
+
+            // Check all other robots against this point
+            for (const auto& [name, ent] : entities) {
+                if (ent->type != EntityType::ROBOT || ent == robot_to_plan) continue;
+                RobotMeta* blocker = dynamic_cast<RobotMeta*>(ent);
+
+                Pose now_pose = timetable.get_pose(blocker, current_time);
+                Pose future_pose = timetable.get_pose(blocker, current_time + LOOKAHEAD_TIME);
+
+                double dist_to_traj = std::hypot(now_pose.x - traj_point.x, now_pose.y - traj_point.y);
+                double moved = std::hypot(future_pose.x - now_pose.x, future_pose.y - now_pose.y);
+
+                if (dist_to_traj < TRAJ_BLOCK_DIST && moved < STATIONARY_THRESHOLD) {
+                    std::cout << "[TRAJ BLOCK] " << blocker->name << " is parked along path of "
+                              << robot_to_plan->name << " (dist=" << dist_to_traj << "m at rel_t=" << rel_t << "). Forcing aside.\n";
+
+                    // Evasive move: perpendicular to trajectory direction at that point
+                    double traj_yaw = traj_point.yaw;
+                    std::vector<double> directions = { traj_yaw + M_PI_2, traj_yaw - M_PI_2 };
+                    bool cleared = false;
+
+                    for (double dir : directions) {
+                        Pose evade_goal = now_pose;
+                        evade_goal.x += 1.5 * std::cos(dir);
+                        evade_goal.y += 1.5 * std::sin(dir);
+
+                        PHAStar evader(blocker, evade_goal, &timetable, &entities, params, false, "", current_time);
+                        auto evade_path = evader.Planning_with_res();
+
+                        if (!evade_path.waypoints.empty()) {
+                            for (auto& wp : evade_path.waypoints) wp.time -= current_time;
+
+                            Trajectory evade_traj;
+                            evade_traj.entity = blocker;
+                            evade_traj.start_time = current_time;
+                            evade_traj.waypoints = evade_path.waypoints;
+                            evade_traj.is_transfer = false;
+
+                            timetable.add_trajectory(evade_traj);
+                            std::cout << "  → " << blocker->name << " moved aside from trajectory.\n";
+                            cleared = true;
+                            cleared_any = true;
+                            break; // one evasive per blocker per point
+                        }
+                    }
+
+                    if (!cleared) {
+                        std::cout << "  → WARN: No evasive path for " << blocker->name << " from traj block.\n";
+                    }
+                    // Only check next traj point if cleared (avoid redundant checks)
+                    break;
+                }
+            }
+
+        }
+    }
+
+    return cleared_any;  // true if we resolved at least one block
 }
 
 
@@ -529,7 +664,7 @@ void process_task_execution(RobotMeta* robot, Task& task, TimeTable& timetable,
 
 int main(int argc, char** argv) {
     // --- 1. Load Data ---
-    std::string filename = std::string(CMAKE_SOURCE_DIR) + "/final_sequence_o13_iros_obj13_v2.txt.b64";
+    std::string filename = std::string(CMAKE_SOURCE_DIR) + "/final_sequence_o11_iros_obj11_v2.txt.b64";
     std::cout << "[System] Loading sequence: " << filename << std::endl;
 
     std::vector<FinalAllocation> loadedSequence = loadFinalSequenceFromFile(filename);

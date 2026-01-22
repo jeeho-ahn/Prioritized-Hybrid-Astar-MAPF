@@ -69,6 +69,13 @@ public:
     RobotMeta* assignedRobot = nullptr;
     ObjectMeta* targetObject = nullptr;
 
+    ////// added to handle obsRelo (need to verify)
+    ReloPush::StatePathPtr firstApproachPath;
+    std::shared_ptr<std::vector<EdgePath>> obsReloPaths;
+    std::unordered_map<std::string, ReloPush::State> obsReloUpdate;
+    std::vector<VertexData> vertexChain;
+    ///////
+
     // constructor without assigned robot
     Task(const FinalAllocation& fa, const std::unordered_map<std::string, EntityMeta*>& entities) {
         StartPoseObj = {fa.startPose.x, fa.startPose.y, fa.startPose.yaw};
@@ -78,8 +85,21 @@ public:
         // Goal of first transit as the starting pose of the task
         TaskStartPoseRobot = PoseFromReloPushState(fa.firstApproachPath->back());
 
+/////////////// need to verify ///////
         // todo: obs relo path
+        firstApproachPath = fa.firstApproachPath;
+        obsReloPaths = fa.obsReloPaths;
+        obsReloUpdate = fa.obsReloUpdate;
+        vertexChain = fa.vertexChain;
 
+        // Extract obs sequence from vertexChain (objects before target)
+        std::vector<std::string> obs_sequence;
+        for (const auto& v : vertexChain) {
+            if (v.type == VertexType::OBJECT_VERTEX && v.name != fa.object.name) {
+                obs_sequence.push_back(v.name);
+            }
+        }
+///////////////////
         EdgePaths.clear();
         // parse trajectories
         //  each edge-path
