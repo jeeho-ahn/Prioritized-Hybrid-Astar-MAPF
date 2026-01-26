@@ -616,7 +616,28 @@ void process_task_execution(RobotMeta* robot, Task& task, TimeTable& timetable,
         return;
     }
 
-    // 2. Execute Edge Paths (Pushing / Relocation Segments)
+    // 2. ObsRelo (if exists)
+    if(task.vertexChain.size()>2)
+    {
+        for(size_t obs_ind=1; obs_ind<task.vertexChain.size()-1; obs_ind++)
+        {
+            std::cout << "obs test" << std::endl;
+
+            // add two-point push to trajectory (obsReloPaths[0])
+            // EdgePath to Trajectory ptr
+            // need to find which object is it from std::string
+            std::string obs_name = task.vertexChain[obs_ind].name;
+            auto obs_meta = entities.at(obs_name);
+            //TrajectoryPtr obs_push_path(robot,);
+
+            // add post-obs path to trajectory (obsReloPaths[1])
+            // convert to Trajectory ptr
+            TrajectoryPtr obs_next_transit;
+        }
+
+    }
+
+    // 3. Execute Edge Paths (Pushing / Relocation Segments)
     int segment_idx = 0;
     for (auto& path_ptr : task.EdgePaths) {
         segment_idx++;
@@ -632,6 +653,8 @@ void process_task_execution(RobotMeta* robot, Task& task, TimeTable& timetable,
         //    (Pass single path as vector to compatible helper)
         resolve_goal_blocking(robot, segment_goal, timetable, entities, params, segment_ready_time,
                               path_ptr->is_transfer, {path_ptr});
+
+        // todo: resolve path blocking
 
         // B. Find Valid Start Time (Collision Delay)
         std::cout << "  [Segment " << segment_idx << "] Checking schedule..." << std::endl;

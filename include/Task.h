@@ -86,14 +86,14 @@ public:
         TaskStartPoseRobot = PoseFromReloPushState(fa.firstApproachPath->back());
 
 /////////////// need to verify ///////
-        // todo: obs relo path
+        // obs relo path
         firstApproachPath = fa.firstApproachPath;
         obsReloPaths = fa.obsReloPaths;
         obsReloUpdate = fa.obsReloUpdate;
         vertexChain = fa.vertexChain;
 
         // Extract obs sequence from vertexChain (objects before target)
-        std::vector<std::string> obs_sequence;
+        std::vector<std::string> obs_sequence; // todo: where to save this?
         for (const auto& v : vertexChain) {
             if (v.type == VertexType::OBJECT_VERTEX && v.name != fa.object.name) {
                 obs_sequence.push_back(v.name);

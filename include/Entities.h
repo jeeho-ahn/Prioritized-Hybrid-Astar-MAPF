@@ -48,6 +48,9 @@ struct Waypoint : public Pose {
 
 typedef std::vector<Waypoint> Path;
 
+/*
+     * Robot, object, time_start, path, is_transfer
+     */
 struct Trajectory {
     EntityMeta* entity = nullptr;
     EntityMeta* transferred_object = nullptr;
