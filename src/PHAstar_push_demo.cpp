@@ -41,6 +41,8 @@ Params initialize_params(const std::vector<FinalAllocation>& loadedSequence) {
     return params;
 }
 
+
+
 std::unordered_map<std::string, EntityMeta*> initialize_entities(const std::vector<FinalAllocation>& loadedSequence) {
     std::unordered_map<std::string, EntityMeta*> entities;
 
@@ -628,11 +630,25 @@ void process_task_execution(RobotMeta* robot, Task& task, TimeTable& timetable,
             // need to find which object is it from std::string
             std::string obs_name = task.vertexChain[obs_ind].name;
             auto obs_meta = entities.at(obs_name);
-            //TrajectoryPtr obs_push_path(robot,);
+            TrajectoryPtr pushing_out_path = ReloPushPath2TrajPtr(task.obsReloPaths->at(0),robot,obs_meta,robot_avail_time);
+            double safe_start_time = find_safe_start_time(pushing_out_path.get(), robot_avail_time, timetable, params);
+            pushing_out_path->start_time = safe_start_time;
+
+            timetable.add_trajectory(*pushing_out_path);
+
+
 
             // add post-obs path to trajectory (obsReloPaths[1])
             // convert to Trajectory ptr
-            TrajectoryPtr obs_next_transit;
+            robot_avail_time = timetable.get_entity_max_time(robot);
+            TrajectoryPtr obs_next_transit = ReloPushPath2TrajPtr(task.obsReloPaths->at(1),robot,obs_meta,robot_avail_time);
+            safe_start_time = find_safe_start_time(pushing_out_path.get(), robot_avail_time, timetable, params);
+            obs_next_transit->start_time = safe_start_time;
+
+            timetable.add_trajectory(*obs_next_transit);
+
+            // for next steps
+            robot_avail_time = timetable.get_entity_max_time(robot);
         }
 
     }

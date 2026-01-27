@@ -18,6 +18,7 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QDialog>
+#include <QDebug>
 #include <vector>
 
 #include <Node.h>

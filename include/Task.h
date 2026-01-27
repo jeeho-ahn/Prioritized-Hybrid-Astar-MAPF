@@ -26,17 +26,19 @@ Waypoint WaypointFromReloPushState(const ReloPush::State& state_in)
     return wp;
 }
 
-TrajectoryPtr ReloPushPath2TrajPtr(const std::shared_ptr<EdgePath> edge) {
+TrajectoryPtr ReloPushPath2TrajPtr(const std::shared_ptr<EdgePath> edgePath,
+                                   RobotMeta* robot_in=nullptr, EntityMeta* transferred_obj=nullptr,
+                                   double start_time = 0.0) {
     Trajectory traj;
-    traj.entity = nullptr;
-    traj.transferred_object = nullptr;
-    traj.start_time = 0.0;
-    traj.is_transfer = edge->is_pushing;
+    traj.entity = robot_in;
+    traj.transferred_object = transferred_obj;
+    traj.start_time = start_time;
+    traj.is_transfer = edgePath->is_pushing;
 
-    if (!std::holds_alternative<ReloPush::StatePathPtr>(edge->path)) {
+    if (!std::holds_alternative<ReloPush::StatePathPtr>(edgePath->path)) {
         return std::make_shared<Trajectory>(traj); // Empty if not StatePath
     }
-    const auto& path_ptr = std::get<ReloPush::StatePathPtr>(edge->path);
+    const auto& path_ptr = std::get<ReloPush::StatePathPtr>(edgePath->path);
     if (!path_ptr || path_ptr->empty()) {
         return std::make_shared<Trajectory>(traj);
     }
@@ -49,6 +51,13 @@ TrajectoryPtr ReloPushPath2TrajPtr(const std::shared_ptr<EdgePath> edge) {
         traj.waypoints.push_back(wp);
     }
     return std::make_shared<Trajectory>(traj);
+}
+
+TrajectoryPtr ReloPushPath2TrajPtr(const EdgePath edgePath,
+                                   RobotMeta* robot_in=nullptr, EntityMeta* transferred_obj=nullptr,
+                                   double start_time = 0.0)
+{
+    return ReloPushPath2TrajPtr(std::make_shared<EdgePath>(edgePath),robot_in,transferred_obj,start_time);
 }
 
 enum DependType { TRANSIT, TRANSFER };
