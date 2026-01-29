@@ -19,6 +19,11 @@
 #include <QLabel>
 #include <QDialog>
 #include <QDebug>
+#include <QPushButton>
+#include <QDoubleSpinBox>
+#include <QTimer>
+#include <QFontMetrics>
+
 #include <vector>
 
 #include <Node.h>
@@ -234,29 +239,100 @@ protected:
     }
 };
 
-void show_results(int argc, char** argv, const TimeTable& timetable, const std::unordered_map<std::string, EntityMeta*>& entities, const std::vector<Trajectory>& all_trajectories, const Params& params) {
+void show_results(int argc, char** argv, const TimeTable& timetable, const std::unordered_map<std::string, EntityMeta*>& entities,
+                  const Params& params) {
     QApplication app(argc, argv);
     QMainWindow win;
-    VizWidget_old* viz = new VizWidget_old(timetable, entities, all_trajectories, params);
+    VizWidget* viz = new VizWidget(timetable, entities, params);
     win.setCentralWidget(viz);
+
+    double max_t = timetable.get_max_time();
+    int max_val = static_cast<int>(max_t * 100 + 0.5);
 
     QWidget* panel = new QWidget;
     QHBoxLayout* layout = new QHBoxLayout(panel);
+
     QSlider* slider = new QSlider(Qt::Horizontal);
-    double max_t = 0.0;
-    for (const auto& traj : all_trajectories) {
-        if (!traj.waypoints.empty()) max_t = timetable.get_max_time();
-    }
-    slider->setRange(0, static_cast<int>(max_t * 100));
-    layout->addWidget(slider);
+    slider->setRange(0, max_val);
+    slider->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+
     QLabel* timeLabel = new QLabel("Time: 0.00 s");
+    timeLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+    // Compute minimum width to prevent layout reflow
+    QFontMetrics fm(timeLabel->font());
+    QString maxTimeStr = QString("Time: %1 s").arg(max_t, 0, 'f', 2);
+    int labelWidth = fm.horizontalAdvance(maxTimeStr) + 20;  // +20 for padding
+    timeLabel->setMinimumWidth(labelWidth);
+
+    QDoubleSpinBox* stepSpin = new QDoubleSpinBox();
+    stepSpin->setRange(0.01, qMax(0.01, max_t));
+    stepSpin->setSingleStep(0.05);
+    stepSpin->setDecimals(2);
+    stepSpin->setValue(0.50);  // Changed to 0.50 s as requested
+    stepSpin->setSuffix(" s");
+
+    QPushButton* prevBtn = new QPushButton("<<");
+    QPushButton* nextBtn = new QPushButton(">>");
+
+    // Enable auto-repeat
+    prevBtn->setAutoRepeat(true);
+    prevBtn->setAutoRepeatDelay(300);
+    prevBtn->setAutoRepeatInterval(100);
+    nextBtn->setAutoRepeat(true);
+    nextBtn->setAutoRepeatDelay(300);
+    nextBtn->setAutoRepeatInterval(100);
+
+    layout->addWidget(new QLabel("Step:"));
+    layout->addWidget(stepSpin);
+    layout->addWidget(prevBtn);
+    layout->addWidget(slider);
+    layout->addWidget(nextBtn);
     layout->addWidget(timeLabel);
 
-    QObject::connect(slider, &QSlider::valueChanged, [viz, timeLabel](int val) {
-        double t = val / 100.0;
+    // Throttled live update during drag
+    QTimer* dragUpdateTimer = new QTimer(&win);
+    dragUpdateTimer->setInterval(50);
+
+    QObject::connect(dragUpdateTimer, &QTimer::timeout, [=]() {
+        double t = slider->value() / 100.0;
         viz->setTime(t);
-        timeLabel->setText(QString("Time: %1 s").arg(t, 0, 'f', 2));
     });
+
+    QObject::connect(slider, &QSlider::sliderPressed, [=]() {
+        dragUpdateTimer->start();
+    });
+
+    QObject::connect(slider, &QSlider::sliderReleased, [=]() {
+        dragUpdateTimer->stop();
+        double t = slider->value() / 100.0;
+        viz->setTime(t);
+    });
+
+    QObject::connect(slider, &QSlider::valueChanged, [=](int val) {
+        double t = val / 100.0;
+        timeLabel->setText(QString("Time: %1 s").arg(t, 0, 'f', 2));
+        if (!slider->isSliderDown()) {
+            viz->setTime(t);
+        }
+    });
+
+    // Step buttons
+    QObject::connect(prevBtn, &QPushButton::clicked, [=]() {
+        double step = stepSpin->value();
+        double curr_t = slider->value() / 100.0;
+        double new_t = qMax(0.0, curr_t - step);
+        slider->setValue(static_cast<int>(new_t * 100 + 0.5));
+    });
+
+    QObject::connect(nextBtn, &QPushButton::clicked, [=]() {
+        double step = stepSpin->value();
+        double curr_t = slider->value() / 100.0;
+        double new_t = qMin(max_t, curr_t + step);
+        slider->setValue(static_cast<int>(new_t * 100 + 0.5));
+    });
+
+    slider->setValue(0);
 
     QDockWidget* dock = new QDockWidget;
     dock->setWidget(panel);
@@ -267,28 +343,99 @@ void show_results(int argc, char** argv, const TimeTable& timetable, const std::
     app.exec();
 }
 
-// without trajectory input
-void show_results(int argc, char** argv, const TimeTable& timetable, const std::unordered_map<std::string, EntityMeta*>& entities,
-                  const Params& params) {
+void show_results(int argc, char** argv, const TimeTable& timetable, const std::unordered_map<std::string, EntityMeta*>& entities, const std::vector<Trajectory>& all_trajectories, const Params& params) {
     QApplication app(argc, argv);
     QMainWindow win;
-    VizWidget* viz = new VizWidget(timetable, entities, params);
+    VizWidget_old* viz = new VizWidget_old(timetable, entities, all_trajectories, params);
     win.setCentralWidget(viz);
+
+    double max_t = 0.0;
+    for (const auto& traj : all_trajectories) {
+        if (!traj.waypoints.empty()) max_t = timetable.get_max_time();
+    }
+    int max_val = static_cast<int>(max_t * 100 + 0.5);
 
     QWidget* panel = new QWidget;
     QHBoxLayout* layout = new QHBoxLayout(panel);
+
     QSlider* slider = new QSlider(Qt::Horizontal);
-    double max_t = timetable.get_max_time();
-    slider->setRange(0, static_cast<int>(max_t * 100));
-    layout->addWidget(slider);
+    slider->setRange(0, max_val);
+    slider->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+
     QLabel* timeLabel = new QLabel("Time: 0.00 s");
+    timeLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+    // Compute minimum width to prevent layout reflow
+    QFontMetrics fm(timeLabel->font());
+    QString maxTimeStr = QString("Time: %1 s").arg(max_t, 0, 'f', 2);
+    int labelWidth = fm.horizontalAdvance(maxTimeStr) + 20;
+    timeLabel->setMinimumWidth(labelWidth);
+
+    QDoubleSpinBox* stepSpin = new QDoubleSpinBox();
+    stepSpin->setRange(0.01, qMax(0.01, max_t));
+    stepSpin->setSingleStep(0.05);
+    stepSpin->setDecimals(2);
+    stepSpin->setValue(0.50);  // Changed to 0.50 s
+    stepSpin->setSuffix(" s");
+
+    QPushButton* prevBtn = new QPushButton("<<");
+    QPushButton* nextBtn = new QPushButton(">>");
+
+    prevBtn->setAutoRepeat(true);
+    prevBtn->setAutoRepeatDelay(300);
+    prevBtn->setAutoRepeatInterval(100);
+    nextBtn->setAutoRepeat(true);
+    nextBtn->setAutoRepeatDelay(300);
+    nextBtn->setAutoRepeatInterval(100);
+
+    layout->addWidget(new QLabel("Step:"));
+    layout->addWidget(stepSpin);
+    layout->addWidget(prevBtn);
+    layout->addWidget(slider);
+    layout->addWidget(nextBtn);
     layout->addWidget(timeLabel);
 
-    QObject::connect(slider, &QSlider::valueChanged, [viz, timeLabel](int val) {
-        double t = val / 100.0;
+    QTimer* dragUpdateTimer = new QTimer(&win);
+    dragUpdateTimer->setInterval(50);
+
+    QObject::connect(dragUpdateTimer, &QTimer::timeout, [=]() {
+        double t = slider->value() / 100.0;
         viz->setTime(t);
-        timeLabel->setText(QString("Time: %1 s").arg(t, 0, 'f', 2));
     });
+
+    QObject::connect(slider, &QSlider::sliderPressed, [=]() {
+        dragUpdateTimer->start();
+    });
+
+    QObject::connect(slider, &QSlider::sliderReleased, [=]() {
+        dragUpdateTimer->stop();
+        double t = slider->value() / 100.0;
+        viz->setTime(t);
+    });
+
+    QObject::connect(slider, &QSlider::valueChanged, [=](int val) {
+        double t = val / 100.0;
+        timeLabel->setText(QString("Time: %1 s").arg(t, 0, 'f', 2));
+        if (!slider->isSliderDown()) {
+            viz->setTime(t);
+        }
+    });
+
+    QObject::connect(prevBtn, &QPushButton::clicked, [=]() {
+        double step = stepSpin->value();
+        double curr_t = slider->value() / 100.0;
+        double new_t = qMax(0.0, curr_t - step);
+        slider->setValue(static_cast<int>(new_t * 100 + 0.5));
+    });
+
+    QObject::connect(nextBtn, &QPushButton::clicked, [=]() {
+        double step = stepSpin->value();
+        double curr_t = slider->value() / 100.0;
+        double new_t = qMin(max_t, curr_t + step);
+        slider->setValue(static_cast<int>(new_t * 100 + 0.5));
+    });
+
+    slider->setValue(0);
 
     QDockWidget* dock = new QDockWidget;
     dock->setWidget(panel);

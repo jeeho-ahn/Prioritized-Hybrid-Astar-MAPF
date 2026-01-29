@@ -608,6 +608,34 @@ void append_retraction(RobotMeta* robot, const Trajectory& previous_traj, TimeTa
 // 3. MAIN TASK PIPELINE
 // ==========================================
 
+// Helper function to handle the scheduling of a single path segment
+void schedule_path_segment(const EdgePath& edge_path,
+                           EntityMeta* obj_meta,
+                           RobotMeta* robot,
+                           TimeTable& timetable,
+                           const Params& params)
+{
+    // 1. Get current available time from the timetable
+    double current_avail_time = timetable.get_entity_max_time(robot);
+
+    // 2. Convert EdgePath to Trajectory
+    // ReloPushPath2TrajPtr is defined in Task.h
+    TrajectoryPtr traj = ReloPushPath2TrajPtr(edge_path, robot, obj_meta, current_avail_time);
+
+    // 3. Find safe start time
+    // Note: The original code had a bug where the second block passed the wrong pointer
+    // to find_safe_start_time. Using traj.get() here ensures we always check the CURRENT path.
+    double safe_start_time = find_safe_start_time(traj.get(), current_avail_time, timetable, params);
+
+    // 4. Update timestamps and add to timetable
+    traj->start_time = safe_start_time;
+
+    // CalcualteTimeStamps is defined in Entities.h
+    traj->CalcualteTimeStamps(robot);
+
+    timetable.add_trajectory(*traj);
+}
+
 void process_task_execution(RobotMeta* robot, Task& task, TimeTable& timetable,
                             const std::unordered_map<std::string, EntityMeta*>& entities, const Params& params)
 {
@@ -619,38 +647,31 @@ void process_task_execution(RobotMeta* robot, Task& task, TimeTable& timetable,
     }
 
     // 2. ObsRelo (if exists)
-    if(task.vertexChain.size()>2)
+    if (task.vertexChain.size() > 2)
     {
-        for(size_t obs_ind=1; obs_ind<task.vertexChain.size()-1; obs_ind++)
+        // Iterate through obstacles
+        // Note: verify if vertexChain indices align 1:1 with obsReloPaths indices
+        for (size_t obs_ind = 1; obs_ind < task.vertexChain.size() - 1; obs_ind++)
         {
-            std::cout << "obs test" << std::endl;
+            std::cout << "Obstacle Relocation" << std::endl;
 
-            // add two-point push to trajectory (obsReloPaths[0])
-            // EdgePath to Trajectory ptr
-            // need to find which object is it from std::string
+            // Identify the obstacle
             std::string obs_name = task.vertexChain[obs_ind].name;
             auto obs_meta = entities.at(obs_name);
-            TrajectoryPtr pushing_out_path = ReloPushPath2TrajPtr(task.obsReloPaths->at(0),robot,obs_meta,robot_avail_time);
-            double safe_start_time = find_safe_start_time(pushing_out_path.get(), robot_avail_time, timetable, params);
-            pushing_out_path->start_time = safe_start_time;
 
-            timetable.add_trajectory(*pushing_out_path);
+            size_t push_path_idx = 0;
+            size_t post_path_idx = 1;
 
+            if (task.obsReloPaths->size() > post_path_idx) {
+                // Step A: Two-point push trajectory
+                schedule_path_segment(task.obsReloPaths->at(push_path_idx), obs_meta, robot, timetable, params);
 
-
-            // add post-obs path to trajectory (obsReloPaths[1])
-            // convert to Trajectory ptr
-            robot_avail_time = timetable.get_entity_max_time(robot);
-            TrajectoryPtr obs_next_transit = ReloPushPath2TrajPtr(task.obsReloPaths->at(1),robot,obs_meta,robot_avail_time);
-            safe_start_time = find_safe_start_time(pushing_out_path.get(), robot_avail_time, timetable, params);
-            obs_next_transit->start_time = safe_start_time;
-
-            timetable.add_trajectory(*obs_next_transit);
-
-            // for next steps
-            robot_avail_time = timetable.get_entity_max_time(robot);
+                // Step B: Schedule the "Post-Obs/Return" path
+                schedule_path_segment(task.obsReloPaths->at(post_path_idx), obs_meta, robot, timetable, params);
+            } else {
+                std::cerr << "Error: obsReloPaths missing required paths for index " << obs_ind << std::endl;
+            }
         }
-
     }
 
     // 3. Execute Edge Paths (Pushing / Relocation Segments)

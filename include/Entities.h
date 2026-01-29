@@ -65,6 +65,7 @@ struct Trajectory {
             waypoints(path_in), is_transfer(is_transfer_in)
     {}
 
+    // assign timestamp to each waypoints based on velocity
     void CalcualteTimeStamps(RobotMeta* robot, double start_time_in = 0.0)
     {
         if (waypoints.empty()) return;
