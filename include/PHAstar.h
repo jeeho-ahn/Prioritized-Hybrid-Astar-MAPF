@@ -42,7 +42,6 @@ struct Node {
 };
 */
 
-
 class PHAStar {
 private:
     RobotMeta* robot;
@@ -405,70 +404,6 @@ private:
         return waypoints;
     }
 
-    CollisionInfo validate_rs_path(const std::vector<Waypoint>& rs_waypoints, double planned_start_t) const {
-        CollisionInfo earliest_info{true, "Valid", "", -1.0};
-
-        for (size_t i = 0; i < rs_waypoints.size(); ++i) {
-            const auto& wp = rs_waypoints[i];
-            double rel_t = wp.time;  // Assuming waypoints have relative time
-            double abs_t = planned_start_t + rel_t;
-
-            // Bounds check
-            Corners corners = get_corners(wp.x, wp.y, wp.yaw, robot->size.front_length,
-                                          robot->size.rear_length, robot->size.width);
-            if (!is_in_bounds(corners, params.min_x, params.max_x, params.min_y, params.max_y)) {
-                std::cout << "[ANALYTIC VIOLATION] OOB at abs_t=" << abs_t
-                          << " (rel_t=" << rel_t << "), pose (x=" << wp.x << ", y=" << wp.y
-                          << ", yaw=" << wp.yaw << ")" << std::endl;
-                if (earliest_info.time < 0 || abs_t < earliest_info.time) {
-                    earliest_info.is_valid = false;
-                    earliest_info.reason = "Out of bounds";
-                    earliest_info.entity_name = "boundary";
-                    earliest_info.time = abs_t;
-                }
-            }
-
-            // Collision check
-            auto occupying = timetable->get_poses(abs_t);
-            for (const auto& [ent, ent_pose] : occupying) {
-                if (ent == ignored_entity || ent == robot) continue;
-
-                Corners ent_corners = get_corners(ent_pose.x, ent_pose.y, ent_pose.yaw,
-                                                  ent->size.front_length, ent->size.rear_length,
-                                                  ent->size.width);
-                if (rectangles_intersect(corners, ent_corners)) {
-                    std::cout << "[ANALYTIC VIOLATION] COLLISION with " << ent->name
-                              << " at abs_t=" << abs_t << " (rel_t=" << rel_t << ")"
-                              << ", this pose (x=" << wp.x << ", y=" << wp.y << ", yaw=" << wp.yaw << ")"
-                              << ", other pose (x=" << ent_pose.x << ", y=" << ent_pose.y << ")" << std::endl;
-
-                    if (earliest_info.time < 0 || abs_t < earliest_info.time) {
-                        earliest_info.is_valid = false;
-                        earliest_info.reason = "Collision";
-                        earliest_info.entity_name = ent->name;
-                        earliest_info.time = abs_t;
-                    }
-                }
-            }
-        }
-        return earliest_info;
-    }
-
-    double compute_min_wait_for_rs(const std::vector<Waypoint>& rs_waypoints, double orig_start_t,
-                                   const std::string& blocker_name, double max_wait = 30.0) const {
-        double wait_delta = 0.0;
-        double step = params.time_step;
-        while (wait_delta <= max_wait) {
-            CollisionInfo temp_info = validate_rs_path(rs_waypoints, orig_start_t + wait_delta);
-            if (temp_info.is_valid) return wait_delta;
-            if (temp_info.reason != "Collision" || temp_info.entity_name != blocker_name) {
-                return -1.0;  // Other issue
-            }
-            wait_delta += step;
-        }
-        return -1.0;  // Unresolvable
-    }
-
 public:
     // robot, goal, timetable, entities, params, is_transfer, obj_name, start_time
     PHAStar(RobotMeta* r, const Pose& goal_pose, TimeTable* tt, const std::unordered_map<std::string, EntityMeta*>* ents,
@@ -658,8 +593,6 @@ public:
                 continue;
 
             auto [rs_path, rs_length] = analytic_expand(current);
-
-
             if (!rs_path.empty())
             {
                 CollisionInfo rs_info = check_collision_along_rs(rs_path, current->t);
@@ -792,17 +725,6 @@ public:
 
             for (auto prim : motion_primitives)
             {
-                int dir = prim.first;
-                double steer = prim.second;
-
-                if (dir == 0) {  // Wait primitive
-                    double dt = params.time_step;
-                    double new_t = current->t + dt;
-                    double wait_cost = dt * params.wait_penalty;
-                    Node* wait_node = new_node(current->x, current->y, current->yaw, new_t, current->cost + wait_cost, 0.0, current, 0);
-                    // Validate wait_node (bounds/collision at new_t) and add to open if valid
-                    continue;
-                }
                 Node *new_node = generate_node(current, prim);
                 if (!new_node)
                     continue;
@@ -829,7 +751,6 @@ public:
     }
 
     // this version is to be deprecated
-
     std::vector<Waypoint> planning() {
         using PQElem = std::tuple<double, uint64_t, Node*>;
         auto cmp = [](const PQElem& a, const PQElem& b) { return std::get<0>(a) > std::get<0>(b) || (std::get<0>(a) == std::get<0>(b) && std::get<1>(a) > std::get<1>(b)); };
@@ -939,7 +860,6 @@ public:
 };
 
 
-
 std::vector<Trajectory> perform_planning(
     const std::unordered_map<std::string, EntityMeta*>& entities,
     const std::vector<std::tuple<std::string, Pose, bool, std::string, double>>& robot_plans,
@@ -965,30 +885,30 @@ std::vector<Trajectory> perform_planning(
 
         PHAStar planner(r, goal_pose, &timetable, &entities, params, trans, obj_name, current_start_t);
         auto start_time = std::chrono::high_resolution_clock::now();
-        auto res = planner.Planning_with_res();
+        auto waypoints = planner.planning();
         auto end_time = std::chrono::high_resolution_clock::now();
 
         // add final push
         double delta_t = params.final_push_distance / r->speed_transit;
-        auto final_push_pose = offsetPose(res.waypoints.back(),params.final_push_distance);
+        auto final_push_pose = offsetPose(waypoints.back(),params.final_push_distance);
         auto final_push_wpt = Waypoint(final_push_pose);
-        final_push_wpt.time = res.waypoints.back().time+delta_t;
-        final_push_wpt.linear_velocity = res.waypoints.back().linear_velocity;
-        res.waypoints.push_back(final_push_wpt);
+        final_push_wpt.time = waypoints.back().time+delta_t;
+        final_push_wpt.linear_velocity = waypoints.back().linear_velocity;
+        waypoints.push_back(final_push_wpt);
 
 
         // Fix double time offset: make waypoint times relative to trajectory start
-        for (auto& wp : res.waypoints) {
+        for (auto& wp : waypoints) {
             wp.time -= current_start_t;
         }
         std::chrono::duration<double> planning_time = end_time - start_time;
         std::cout << "Planning time for " << r_name << ": " << planning_time.count() << " seconds" << std::endl;
 
-        if (!res.waypoints.empty()) {
-            std::cout << "Last waypoint for " << r_name << ": time=" << res.waypoints.back().time << ", x=" << res.waypoints.back().x << ", y=" << res.waypoints.back().y << ", yaw=" << res.waypoints.back().yaw << std::endl;
+        if (!waypoints.empty()) {
+            std::cout << "Last waypoint for " << r_name << ": time=" << waypoints.back().time << ", x=" << waypoints.back().x << ", y=" << waypoints.back().y << ", yaw=" << waypoints.back().yaw << std::endl;
 
             if(print_path){
-                for (const auto& wp : res.waypoints) {
+                for (const auto& wp : waypoints) {
                     std::cout << "time=" << wp.time << ", x=" << wp.x << ", y=" << wp.y << ", yaw=" << wp.yaw << std::endl;
                 }
             }
@@ -996,15 +916,15 @@ std::vector<Trajectory> perform_planning(
             Trajectory traj;
             traj.entity = r;
             traj.start_time = current_start_t;
-            traj.waypoints = res.waypoints;
+            traj.waypoints = waypoints;
             traj.is_transfer = trans;
             traj.transferred_object = trans ? entities.at(obj_name) : nullptr;
             all_trajectories.push_back(traj);
             timetable.add_trajectory(traj);
 
             // Update for potential next plan for this robot
-            robot_current_times[r_name] = current_start_t + res.waypoints.back().time;
-            robot_current_poses[r_name] = {res.waypoints.back().x, res.waypoints.back().y, res.waypoints.back().yaw};
+            robot_current_times[r_name] = current_start_t + waypoints.back().time;
+            robot_current_poses[r_name] = {waypoints.back().x, waypoints.back().y, waypoints.back().yaw};
         } else {
             std::cout << "Failed to find a path for " << r_name << std::endl;
             // Continue to next plan, but note failure
