@@ -21,7 +21,6 @@
 #include <limits>
 #include <random>
 
-const bool DEBUG_VIS = true;
 
 // ==========================================
 // 1. HELPER & UTILITY FUNCTIONS
@@ -68,7 +67,7 @@ initialize_entities(const std::vector<FinalAllocation> &loadedSequence) {
   entities["robot1"] = robot1;
 
   // Robot 2
-  /*
+  
       RobotMeta* robot2 = new RobotMeta;
       robot2->name = "robot2";
       robot2->type = EntityType::ROBOT;
@@ -81,7 +80,7 @@ initialize_entities(const std::vector<FinalAllocation> &loadedSequence) {
       robot2->speed_transit = 0.2;
       robot2->speed_transfer = 0.15;
       entities["robot2"] = robot2;
-  */
+  
   /*
   RobotMeta* robot3 = new RobotMeta;
   robot3->name = "robot3";
@@ -297,6 +296,21 @@ bool plan_initial_transit(
 
     return false;
   }
+
+  if (DEBUG_VIS) {
+    std::cout << "[Debug] Visualizing Plan..." << std::endl;
+        
+    visualize_planning_debug(
+            timetable,           // Global history/future of others
+            robot,  // The robot executing this plan
+            path_res,              // The output plan (waypoints)
+            start_time,  // Absolute start time for this plan
+            current_pose,  // Start
+            target_pose,   // Goal
+            params
+        );
+  }
+  
 
   // add final push
   double delta_t = params.final_push_distance / robot->speed_transit;

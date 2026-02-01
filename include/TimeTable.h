@@ -99,6 +99,11 @@ public:
         return poses;
     }
 
+    // for visualization
+    const std::unordered_map<EntityMeta*, std::map<double, Pose>>& get_database() const {
+        return per_entity_table;
+    }
+
     double get_max_time() const {
         double max_t = 0.0;
         for (const auto& [ent, m] : per_entity_table) {
@@ -115,6 +120,33 @@ public:
             return 0.0;
         }
         return it->second.rbegin()->first + margin;
+    }
+
+    // In TimeTable class (TimeTable.h)
+    bool is_entity_static_after(double after_t, EntityMeta* ent) const {
+        auto it = per_entity_table.find(ent);
+        if (it == per_entity_table.end()) return true;  // No trajectory → static
+
+        const auto& time_pose_map = it->second;
+        if (time_pose_map.empty()) return true;
+
+        // Find the latest time >= after_t
+        auto latest_it = time_pose_map.lower_bound(after_t);
+        if (latest_it == time_pose_map.end()) {
+            // No future poses; check if last pose is constant (assume yes if no more entries)
+            return true;
+        }
+
+        // If multiple poses after after_t, but all identical → static
+        Pose last_pose = latest_it->second;
+        ++latest_it;
+        for (; latest_it != time_pose_map.end(); ++latest_it) {
+            if (std::hypot(last_pose.x - latest_it->second.x, last_pose.y - latest_it->second.y) > 1e-3 ||
+                std::abs(mod2pi(last_pose.yaw - latest_it->second.yaw)) > 1e-3) {
+                return false;  // Still moving
+            }
+        }
+        return true;  // No changes → static
     }
 
     static Pose compute_object_pose(const Pose& robot_pose, const OccuRect& robot_size, const OccuRect& obj_size) {

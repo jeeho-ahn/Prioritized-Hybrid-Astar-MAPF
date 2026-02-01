@@ -31,6 +31,7 @@
 #include <Entities.h>
 #include <Params.h>
 #include <TimeTable.h>
+#include <PlanningResult.h>
 
 std::tuple<double, double, double> interpolate_timed_path(const std::vector<Waypoint> &waypoints, double t)
 {
@@ -699,5 +700,265 @@ void visualize_search_tree(const std::vector<Node>& nodes, const Params& params)
     }
 }
 
+// ==========================================
+// PLANNING DEBUG VISUALIZATION (Visualization.h)
+// ==========================================
 
+// Helper to get corners for drawing (Local calculation)
+inline std::vector<Point> get_corners_local(double x, double y, double yaw, double fl, double rl, double w) {
+    double cos_y = std::cos(yaw);
+    double sin_y = std::sin(yaw);
+    double dx_fl = fl * cos_y;
+    double dy_fl = fl * sin_y;
+    double dx_rl = rl * cos_y;
+    double dy_rl = rl * sin_y;
+    double dx_w = (w/2.0) * sin_y;
+    double dy_w = (w/2.0) * cos_y;
+
+    return {
+        {x + dx_fl - dx_w, y + dy_fl + dy_w}, // Front Left
+        {x + dx_fl + dx_w, y + dy_fl - dy_w}, // Front Right
+        {x - dx_rl + dx_w, y - dy_rl - dy_w}, // Rear Right
+        {x - dx_rl - dx_w, y - dy_rl + dy_w}  // Rear Left
+    };
+}
+
+class PlanningDebugWidget : public QDialog {
+public:
+    PlanningDebugWidget(const TimeTable& tt, 
+                        RobotMeta* robot,
+                        const PlanningResult& result,
+                        double start_time,
+                        const Pose& start,
+                        const Pose& goal,
+                        const Params& p,
+                        QWidget* parent = nullptr)
+        : QDialog(parent), timetable(tt), 
+          active_robot(robot), plan(result), 
+          plan_start_time(start_time),
+          start_pose(start), goal_pose(goal), params(p) 
+    {
+        plan_duration = 0.0;
+        if (!plan.waypoints.empty()) {
+            plan_duration = plan.waypoints.back().time;
+        } else {
+            // Default window if plan is empty/failed
+            plan_duration = 10.0; 
+        }
+        
+        setWindowTitle(QString("Debug: %1 (t=%2 to %3)")
+                       .arg(QString::fromStdString(robot->name))
+                       .arg(start_time, 0, 'f', 2)       // %2: start time, 2 decimal places
+                       .arg(start_time + plan_duration, 0, 'f', 2)); // %3: end time
+        
+        // Resize to accommodate side panel
+        resize(1200, 800);
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter p(this);
+        p.setRenderHint(QPainter::Antialiasing);
+        p.fillRect(rect(), Qt::white);
+
+        // --- Layout Configuration ---
+        int legend_width = 260; 
+        int view_width = width() - legend_width; 
+        int view_height = height();
+
+        // --- 1. Transform Setup ---
+        double margin = 1.0; 
+        double w_real = (params.max_x - params.min_x) + 2*margin;
+        double h_real = (params.max_y - params.min_y) + 2*margin;
+        
+        // Scale to fit ONLY in the view area
+        double scale = std::min((double)view_width / w_real, (double)view_height / h_real);
+
+        auto toScreen = [&](double x, double y) {
+            return QPointF((x - params.min_x + margin) * scale, 
+                           (params.max_y - y + margin) * scale); // Flip Y
+        };
+
+        // --- 2. Draw Workspace Boundary ---
+        p.setPen(QPen(Qt::black, 3, Qt::SolidLine));
+        p.setBrush(Qt::NoBrush);
+        p.drawRect(QRectF(toScreen(params.min_x, params.max_y), toScreen(params.max_x, params.min_y)));
+
+        // Vertical separator line
+        p.setPen(QPen(Qt::gray, 1));
+        p.drawLine(view_width, 0, view_width, height());
+
+        // --- 3. Draw Entities (Context) ---
+        for (const auto& [entity, timeline] : timetable.get_database()) {
+            if (entity == active_robot) continue; 
+
+            // Interpolate at exactly the start time
+            Pose current_pose = interpolate_pose(timeline, plan_start_time);
+            
+            QColor bodyColor;
+            if (entity->type == EntityType::OBJECT) {
+                bodyColor = QColor(255, 140, 0, 150); // Orange for Objects
+            } else {
+                bodyColor = QColor(100, 100, 100, 150); // Dark Grey for Robots
+            }
+
+            drawShape(p, current_pose, entity, bodyColor, QPen(Qt::black, 1), toScreen, QString::fromStdString(entity->name));
+            
+            // Draw trail only if it moves in the window
+            drawTrail(p, timeline, plan_start_time, plan_start_time + plan_duration, toScreen);
+        }
+
+        // --- 4. Draw Active Robot Plan ---
+        if (!plan.waypoints.empty()) {
+            QPolygonF path;
+            for (const auto& wp : plan.waypoints) {
+                path << toScreen(wp.x, wp.y);
+            }
+            p.setPen(QPen(QColor(0, 102, 255), 3, Qt::SolidLine)); 
+            p.drawPolyline(path);
+        }
+
+        // --- 5. Draw Active Start / Goal ---
+        drawShape(p, start_pose, active_robot, QColor(50, 205, 50, 180), QPen(Qt::black, 2), toScreen, "START");
+        drawShape(p, goal_pose, active_robot, QColor(220, 20, 60, 180), QPen(Qt::black, 2, Qt::DashLine), toScreen, "GOAL");
+
+        // --- 6. Draw Legend (Side Panel) ---
+        drawLegend(p, view_width + 10, 20, legend_width - 20);
+    }
+
+private:
+    Pose interpolate_pose(const std::map<double, Pose>& timeline, double t) {
+        if (timeline.empty()) return Pose();
+        auto it = timeline.lower_bound(t);
+        
+        if (it == timeline.end()) return timeline.rbegin()->second;
+        if (it->first == t || it == timeline.begin()) return it->second;
+
+        auto prev = std::prev(it);
+        double t1 = prev->first;
+        double t2 = it->first;
+        Pose p1 = prev->second;
+        Pose p2 = it->second;
+
+        double ratio = (t - t1) / (t2 - t1);
+        Pose p;
+        p.x = p1.x + ratio * (p2.x - p1.x);
+        p.y = p1.y + ratio * (p2.y - p1.y);
+        
+        double dyaw = p2.yaw - p1.yaw;
+        while (dyaw > M_PI) dyaw -= 2 * M_PI;
+        while (dyaw < -M_PI) dyaw += 2 * M_PI;
+        p.yaw = p1.yaw + ratio * dyaw;
+        return p;
+    }
+
+    template<typename Func>
+    void drawTrail(QPainter& p, const std::map<double, Pose>& timeline, double t_start, double t_end, Func toScreen) {
+        QPolygonF path;
+        auto it = timeline.lower_bound(t_start);
+        
+        if (it != timeline.begin()) {
+             Pose start_p = interpolate_pose(timeline, t_start);
+             path << toScreen(start_p.x, start_p.y);
+        }
+
+        for (; it != timeline.end() && it->first <= t_end; ++it) {
+            path << toScreen(it->second.x, it->second.y);
+        }
+        
+        if (it != timeline.end()) {
+             Pose end_p = interpolate_pose(timeline, t_end);
+             path << toScreen(end_p.x, end_p.y);
+        }
+
+        if (path.size() > 1) {
+            p.setPen(QPen(QColor(150, 150, 150), 2, Qt::DashLine));
+            p.setBrush(Qt::NoBrush);
+            p.drawPolyline(path);
+        }
+    }
+
+    template<typename Func>
+    void drawShape(QPainter& p, Pose pose, EntityMeta* ent, QColor brush, QPen pen, Func toScreen, QString label = "") {
+        auto c = get_corners_local(pose.x, pose.y, pose.yaw, ent->size.front_length, ent->size.rear_length, ent->size.width);
+        QPolygonF poly;
+        for (auto& pt : c) poly << toScreen(pt.x, pt.y);
+        
+        p.setBrush(brush);
+        p.setPen(pen);
+        p.drawPolygon(poly);
+
+        if (!label.isEmpty()) {
+            p.setPen(Qt::black);
+            p.drawText(toScreen(pose.x, pose.y) + QPointF(0, -5), label);
+        }
+        
+        QPointF center = toScreen(pose.x, pose.y);
+        QPointF front = toScreen(pose.x + 0.3 * std::cos(pose.yaw), pose.y + 0.3 * std::sin(pose.yaw));
+        p.setPen(Qt::black);
+        p.drawLine(center, front);
+    }
+
+    void drawLegend(QPainter& p, int x, int y, int w) {
+        p.setBrush(QColor(245, 245, 245)); 
+        p.setPen(Qt::black);
+        p.drawRect(x, y, w, 220); 
+
+        int cy = y + 25;
+        auto item = [&](QString t, QColor c, Qt::PenStyle s, bool line) {
+            p.setPen(Qt::black); 
+            p.drawText(x + 40, cy + 5, t);
+            
+            if(line) { 
+                p.setPen(QPen(c, 2, s)); 
+                p.drawLine(x+10, cy, x+30, cy); 
+            } else { 
+                p.setBrush(c); 
+                p.setPen(Qt::black); 
+                p.drawRect(x+10, cy-7, 15, 15); 
+            }
+            cy += 25;
+        };
+
+        p.setFont(QFont("Arial", 10, QFont::Bold));
+        p.drawText(x+10, y+18, "Context (t=" + QString::number(plan_start_time, 'f', 1) + ")");
+        p.setFont(QFont("Arial", 9));
+        
+        cy += 5;
+        item("Active Plan", QColor(0, 102, 255), Qt::SolidLine, true);
+        item("Start Pose", QColor(50, 205, 50, 180), Qt::SolidLine, false);
+        item("Goal Pose", QColor(220, 20, 60, 180), Qt::DashLine, false);
+        item("Object", QColor(255, 140, 0, 150), Qt::SolidLine, false);
+        item("Other Robot", QColor(100, 100, 100, 150), Qt::SolidLine, false);
+        item("Other Trail", QColor(150, 150, 150), Qt::DashLine, true);
+    }
+
+    const TimeTable& timetable;
+    RobotMeta* active_robot;
+    PlanningResult plan;
+    double plan_start_time;
+    double plan_duration;
+    Pose start_pose;
+    Pose goal_pose;
+    Params params;
+};
+
+// Main entry point for visualization
+void visualize_planning_debug(const TimeTable& tt, 
+                              RobotMeta* robot,
+                              const PlanningResult& result,
+                              double start_time,
+                              const Pose& start,
+                              const Pose& goal,
+                              const Params& params) 
+{
+    if (!QApplication::instance()) {
+        static int argc = 1;
+        static char arg[] = "viz";
+        static char* argv[] = {arg};
+        new QApplication(argc, argv);
+    }
+    PlanningDebugWidget w(tt, robot, result, start_time, start, goal, params);
+    w.exec();
+}
 #endif // VISUALIZATION_H
