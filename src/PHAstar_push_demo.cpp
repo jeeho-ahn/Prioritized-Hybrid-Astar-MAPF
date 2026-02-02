@@ -23,7 +23,7 @@
 #include <random>
 
 
-const bool DEBUG_VIS = true;
+const bool DEBUG_VIS = false;
 
 
 // ==========================================
@@ -847,6 +847,10 @@ void schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
   // ReloPushPath2TrajPtr is defined in Task.h
   TrajectoryPtr traj =
       ReloPushPath2TrajPtr(edge_path, robot, obj_meta, current_avail_time);
+
+  // FIX: Ensure entity and relative timestamps are set for collision checking!
+  traj->entity = robot;
+  traj->CalcualteTimeStamps(robot);
 
   // 3. Find safe start time
   double safe_start_time =

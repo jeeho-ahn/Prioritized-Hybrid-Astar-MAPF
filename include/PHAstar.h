@@ -61,7 +61,7 @@ public:
     PlanningResult backup_result;
     
     // Search limits
-    int max_search_iterations = 50000;
+    int max_search_iterations = 3000;
 
     // For diagnostics
     double max_planning_time = 10.0; // [s] timeout threshold (tune via params if needed)
