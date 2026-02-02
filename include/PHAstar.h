@@ -16,10 +16,11 @@
 #include <TimeTable.h>
 #include <Visualization.h>
 #include <PlanningResult.h>
+#include <CollisionUtils.h>
 
 // PHA* Implementation
 
-const bool DEBUG_VIS = true;
+extern const bool DEBUG_VIS;
 
 bool is_in_bounds(const Corners& corners, double min_x, double max_x, double min_y, double max_y) {
     for (const auto& c : corners) {
@@ -49,15 +50,18 @@ private:
     TimeTable* timetable;
     const std::unordered_map<std::string, EntityMeta*>* entities;
     ObjectMeta* transferred = nullptr;
-    ObjectMeta* ignored_entity = nullptr;
+    EntityMeta* ignored_entity = nullptr;
     bool is_transfer;
+    bool ignore_other_robots = false; // New flag for ghost planning
     Params params;
     int x_width, y_width, theta_width, time_width;
     std::vector<double> entity_diags;
+    
+    // Backup path (valid geometry but blocked by relocatable robot)
+    PlanningResult backup_result;
 
     // For diagnostics
     double max_planning_time = 10.0; // [s] timeout threshold (tune via params if needed)
-    int max_iterations = 100000;     // Prevent infinite loops
     std::chrono::time_point<std::chrono::high_resolution_clock> start_clock;
 
     size_t calc_grid_index(const Node* node) {
@@ -119,85 +123,57 @@ private:
         result.time = node->t;
 
         double t = node->t;
+        Pose robot_pose = {node->x, node->y, node->yaw};
         auto poses = timetable->get_poses(t);
 
-        // --- 1. Robot Bounds Check ---
-        double front_inf = robot->size.front_length * params.inflation;
-        double rear_inf = robot->size.rear_length * params.inflation;
-        double width_inf = robot->size.width * params.inflation;
+        // Setup robot collision geometry
+        CollisionGeometry robot_geom = setup_collision_geometry(robot_pose, robot->size, params.inflation);
 
-        auto robot_corners = get_corners(node->x, node->y, node->yaw, front_inf, rear_inf, width_inf);
-
-        if (!is_in_bounds(robot_corners, params.min_x, params.max_x, params.min_y, params.max_y)) {
+        // Check robot bounds
+        if (check_bounds_collision(robot_geom.corners, params.min_x, params.max_x, params.min_y, params.max_y)) {
             return {false, "Robot Out of Bounds", "Boundary", t};
         }
 
-        // --- 2. Object Setup ---
+        // Setup object geometry (if transferring)
+        CollisionGeometry obj_geom;
         Pose obj_pose;
-        Corners obj_corners;
-        double obj_diag = 0.0;
+        const CollisionGeometry* obj_geom_ptr = nullptr;
+        const Pose* obj_pose_ptr = nullptr;
 
         if (is_transfer && transferred) {
-            obj_pose = TimeTable::compute_object_pose({node->x, node->y, node->yaw}, robot->size, transferred->size);
-
-            // Check Object Bounds
-            obj_corners = get_corners(obj_pose.x, obj_pose.y, obj_pose.yaw,
-                                      transferred->size.front_length * params.inflation,
-                                      transferred->size.rear_length * params.inflation,
-                                      transferred->size.width * params.inflation);
-
-            if (!is_in_bounds(obj_corners, params.min_x, params.max_x, params.min_y, params.max_y)) {
+            obj_pose = TimeTable::compute_object_pose(robot_pose, robot->size, transferred->size);
+            obj_geom = setup_collision_geometry(obj_pose, transferred->size, params.inflation);
+            
+            // Check object bounds
+            if (check_bounds_collision(obj_geom.corners, params.min_x, params.max_x, params.min_y, params.max_y)) {
                 return {false, "Object Out of Bounds", "Boundary", t};
             }
-
-            obj_diag = std::sqrt(std::pow(transferred->size.front_length + transferred->size.rear_length, 2) +
-                                 std::pow(transferred->size.width, 2)) / 2.0 * params.inflation;
+            
+            obj_geom_ptr = &obj_geom;
+            obj_pose_ptr = &obj_pose;
         }
+
+        // Check collisions against all entities
+        // Filter out robots if ignore_other_robots is true
+        std::unordered_map<EntityMeta*, Pose> filtered_poses;
+        if (ignore_other_robots) {
+             for (const auto& [ent, p] : poses) {
+                 if (ent->type != EntityType::ROBOT) {
+                     filtered_poses[ent] = p;
+                 }
+             }
+        } 
         
-        // --- 3. Dynamic Obstacle Check ---
-        double robot_diag = std::sqrt(std::pow(front_inf + rear_inf, 2) + std::pow(width_inf, 2)) / 2.0;
+        auto collision_result = check_multiple_entities_collision(
+            robot_geom, robot_pose,
+            obj_geom_ptr, obj_pose_ptr,
+            ignore_other_robots ? filtered_poses : poses, params,
+            robot, transferred, ignored_entity
+        );
 
-        size_t idx = 0;
-        for (const auto& [ent, pose] : poses) {
-            // Skip self or ignored
-            if (ent == robot || ent == transferred || ent == ignored_entity) {
-                // Note: If 'poses' and 'entity_diags' are aligned by index, we must increment idx even if we continue
-                // If they are not aligned by index in your original code, remove ++idx here.
-                // Assuming your original logic relied on idx syncing with iterator:
-                // (Your original code didn't increment idx on continue, which might be a bug if entity_diags is a parallel vector.
-                //  If entity_diags is just a lookup map, ignore idx. I will assume entity_diags is parallel to poses iterator).
-                // ++idx; // Uncomment if entity_diags is a vector matching poses order
-                continue;
-            }
-
-            // 3a. Robot vs Entity
-            double dist_r = std::hypot(node->x - pose.x, node->y - pose.y);
-
-            // Fast Check (Circle)
-            // Ensure entity_diags[idx] access is safe or look it up from ent
-            double ent_diag = std::hypot(ent->size.front_length + ent->size.rear_length, ent->size.width) / 2.0 * params.inflation;
-
-            if (dist_r <= robot_diag + ent_diag + params.safety_margin) {
-                auto other_corners = get_corners(pose.x, pose.y, pose.yaw,
-                                                 ent->size.front_length * params.inflation,
-                                                 ent->size.rear_length * params.inflation,
-                                                 ent->size.width * params.inflation);
-
-                if (rectangles_intersect(robot_corners, other_corners)) {
-                    return {false, "Robot Collision", ent->name, t};
-                }
-
-                // 3b. Object vs Entity
-                if (is_transfer && transferred) {
-                    double dist_o = std::hypot(obj_pose.x - pose.x, obj_pose.y - pose.y);
-                    if (dist_o <= obj_diag + ent_diag + params.safety_margin) {
-                        if (rectangles_intersect(obj_corners, other_corners)) {
-                            return {false, "Object Collision", ent->name, t};
-                        }
-                    }
-                }
-            }
-            // ++idx; // Uncomment if using parallel vector
+        if (collision_result.has_collision) {
+            return {false, collision_result.collision_type + " Collision", 
+                    collision_result.colliding_entity->name, t};
         }
 
         return {true, "Valid", "", t};
@@ -209,14 +185,17 @@ private:
         double distance = std::hypot(new_node->x - current->x, new_node->y - current->y);
         double steer_adjusted = (direction > 0) ? steer : -steer;
         double time_inc = params.time_step;
-        double front_inf = robot->size.front_length * params.inflation;
-        double rear_inf = robot->size.rear_length * params.inflation;
-        double width_inf = robot->size.width * params.inflation;
-        double diag_r = std::sqrt((front_inf + rear_inf) * (front_inf + rear_inf) + width_inf * width_inf) / 2;
+        
+        // Pre-compute robot geometry (constant along path)
+        Pose dummy_pose = {0, 0, 0};
+        CollisionGeometry robot_geom = setup_collision_geometry(dummy_pose, robot->size, params.inflation);
+        
         for (int i = 1; i <= params.collision_steps; ++i) {
             double frac = static_cast<double>(i) / params.collision_steps;
             double d = frac * distance;
             double x_i = current->x, y_i = current->y, yaw_i = current->yaw;
+            
+            // Compute intermediate pose
             if (direction != 0) {
                 if (std::abs(steer_adjusted) < 1e-5) {
                     x_i += (d / distance) * (new_node->x - current->x);
@@ -229,21 +208,22 @@ private:
                     yaw_i += beta;
                 }
             }
+            
             double t_i = current->t + frac * time_inc;
-            auto corners_r = get_corners(x_i, y_i, yaw_i, front_inf, rear_inf, width_inf);
-            if (!is_in_bounds(corners_r, params.min_x, params.max_x, params.min_y, params.max_y)) return false;
+            Pose check_pose = {x_i, y_i, yaw_i};
+            
+            // Update geometry with actual pose
+            CollisionGeometry geom_at_pose = setup_collision_geometry(check_pose, robot->size, params.inflation);
+            
+            // Check bounds
+            if (check_bounds_collision(geom_at_pose.corners, params.min_x, params.max_x, params.min_y, params.max_y)) {
+                return false;
+            }
+            
+            // Check entity collisions
             auto poses = timetable->get_poses(t_i);
-            size_t idx = 0;
-            for (const auto& [ent, pose] : poses) {
-                if (ent == robot || ent == transferred || ent == ignored_entity) continue;
-                double dist_o = std::hypot(x_i - pose.x, y_i - pose.y);
-                if (dist_o > diag_r + entity_diags[idx] + params.safety_margin) {
-                    ++idx;
-                    continue;
-                }
-                auto corners_o = get_corners(pose.x, pose.y, pose.yaw, ent->size.front_length, ent->size.rear_length, ent->size.width);
-                if (rectangles_intersect(corners_r, corners_o)) return false;
-                ++idx;
+            if (check_simple_collision(geom_at_pose, check_pose, poses, params, robot, ignored_entity)) {
+                return false;
             }
         }
         return true;
@@ -315,6 +295,9 @@ private:
         double speed_val = speed; 
         if (speed_val <= 1e-6) speed_val = 0.1; // Prevent division by zero
 
+        bool robot_collision_found = false;
+        CollisionInfo robot_col_info;
+
         for (size_t i = 0; i < rs_path.size() - 1; ++i) {
             auto [x1, y1, yaw1] = rs_path[i];
             auto [x2, y2, yaw2] = rs_path[i + 1];
@@ -345,12 +328,26 @@ private:
                     
                     CollisionInfo info = check_collision_at(&temp_node);
                     if (!info.is_valid) {
-                        return info; // Return the specific failure immediately
+                         if (info.reason.find("Robot") != std::string::npos) {
+                             // Soft Collision: Record and Continue
+                             if (!robot_collision_found) {
+                                 robot_collision_found = true;
+                                 robot_col_info = info;
+                             }
+                         } else {
+                             // Hard Collision: Return Failure Immediately
+                             return info; 
+                         }
                     }
                 }
                 current_t += time_inc;
             }
         }
+        
+        if (robot_collision_found) {
+            return robot_col_info; // Allows caller to identify it was blocked by robot
+        }
+
         return {true, "Valid", "", 0.0};
     }
 
@@ -422,7 +419,7 @@ public:
             transferred = nullptr;
 
             if (!obj_name.empty()) {
-                ignored_entity = dynamic_cast<ObjectMeta*>(it->second);
+                ignored_entity = it->second;
             }
         }
 
@@ -535,7 +532,7 @@ public:
         PlanningResult res;
         // Step 1: Quick start/goal validation
         PlanningResult validation = validate_start_goal(check_time, /* pass actual goal_pose from constructor or member */ Pose(goal->x,goal->y,goal->yaw)); // Assume goal_pose is a member; adjust if needed
-        if (validation.status != PlanningStatus::SUCCESS)
+        if (validation.status == PlanningStatus::GOAL_OUT_OF_BOUNDS)
         {
             return validation;
         }
@@ -555,6 +552,11 @@ public:
 
         size_t iteration = 0; // for debug
         static int debug_counter = 0;
+        
+        // Clear previous backup
+        backup_result.status = PlanningStatus::INTERNAL_ERROR;
+        backup_result.waypoints.clear();
+
         while (!open_set.empty())
         {
             iteration++;
@@ -564,6 +566,11 @@ public:
                           << ", current f-cost: " << std::get<0>(open_set.top()) << std::endl;
             }
 
+            // Early exit if we have a backup and search is taking too long
+            if (iteration > 50000 && backup_result.status == PlanningStatus::BLOCKED_BY_ROBOT) {
+                std::cout << "Hit iteration limit (50000) with backup path available. Returning backup." << std::endl;
+                return backup_result;
+            }
 
             auto [f, _, current] = open_set.top();
             open_set.pop();
@@ -603,7 +610,8 @@ public:
 
                     // Post-arrival check
                     bool post_safe = true;
-                    CollisionInfo post_arrival_collision;  // Capture the collision that causes rejection
+                    bool post_blocked_by_robot = false;
+                    CollisionInfo post_arrival_collision;
                     for (double future_t = arrival_t + params.time_step; future_t <= params.max_time; future_t += params.time_step)
                     {
                         Node dummy(goal->x, goal->y, goal->yaw, future_t, 0.0, 0.0, nullptr, 0);
@@ -611,7 +619,10 @@ public:
                         if (!collision_result.is_valid)
                         {
                             post_safe = false;
-                            post_arrival_collision = collision_result;  // Store the collision info
+                            post_arrival_collision = collision_result;
+                            if (collision_result.reason.find("Robot") != std::string::npos) {
+                                post_blocked_by_robot = true;
+                            }
                             break;
                         }
                     }
@@ -621,17 +632,25 @@ public:
                         std::cout << "Goal found with analytic expansion!" << std::endl;
                         return {waypoints, PlanningStatus::SUCCESS, ""};
                     }
-                    // Else continue searching
-                    else
+                    else if (post_blocked_by_robot)
                     {
-                        std::cout << "Analytic (Reeds-Shepp) path generated but rejected due to collision or bounds violation" << std::endl;
-                        // Only visualize if we are VERY close to the goal (to avoid spamming for every node)
-                        // Or just visualize the first few failures.
-                        
-                        std::cout << "\n[DEBUG TRAP] Analytic Path Rejected!" << std::endl;
-                        std::cout << "  > Reason: " << post_arrival_collision.reason << std::endl;
-                        std::cout << "  > Entity: " << post_arrival_collision.entity_name << std::endl;
-                        std::cout << "  > Time:   " << post_arrival_collision.time << std::endl;
+                        // Blocked at goal by a robot. Save as backup.
+                        if (backup_result.status != PlanningStatus::BLOCKED_BY_ROBOT) {
+                             backup_result.waypoints = waypoints;
+                             backup_result.status = PlanningStatus::BLOCKED_BY_ROBOT;
+                             backup_result.colliding_entity = post_arrival_collision.entity_name;
+                             backup_result.failure_detail = "Blocked at goal by " + post_arrival_collision.entity_name;
+                             backup_result.failure_time = post_arrival_collision.time;
+                        }
+                    }
+                    else // Hard collision in post-safe check
+                    {
+                        static int post_fail_counter = 0;
+                        if (DEBUG_VIS && post_fail_counter++ < 2) {
+                            std::cout << "\n[DEBUG TRAP] Analytic Post-Arrival Rejected (Hard Collision)" << std::endl;
+                            std::cout << "  > Reason: " << post_arrival_collision.reason << std::endl;
+                            std::cout << "  > Entity: " << post_arrival_collision.entity_name << std::endl;
+                        }
                         
                         // Construct a temporary Failed Result to visualize
                         PlanningResult failed_res;
@@ -645,49 +664,31 @@ public:
                             *timetable, 
                             robot, 
                             failed_res, 
-                            post_arrival_collision.time, // The time of the node being expanded
-                            current_pose, // Where the shot started
+                            post_arrival_collision.time,
+                            current_pose,
                             goal_pose, 
                             params
                         );
-                                            
                     }
                 }
-                else
+                else  // CollisionInfo (rs_info) not valid
                 {
-                    //std::cout << "DEBUG_RS_FAIL: RS Path collided! Dist=" << std::hypot(current->x - goal->x, current->y - goal->y)
-                     //         << " NodeT=" << current->t << std::endl;
-                     static int debug_counter = 0;
-                    if (DEBUG_VIS && debug_counter++ < 5) {
-                        std::cout << "\n[DEBUG TRAP] Analytic Path Rejected (along RS)" << std::endl;
-                        std::cout << "  > Reason: " << rs_info.reason << std::endl;
-                        std::cout << "  > Entity: " << rs_info.entity_name << std::endl;
-                        std::cout << "  > Time:   " << rs_info.time << std::endl;
-
-                        // Convert tuples to Waypoints for visualization
-                        std::vector<Waypoint> debug_waypoints;
-                        double t = current->t;
-                        for(size_t i=0; i<rs_path.size()-1; ++i) {
-                            auto [x1,y1,yaw1] = rs_path[i];
-                            auto [x2,y2,yaw2] = rs_path[i+1];
-                            double dist = std::hypot(x2-x1, y2-y1);
-                            t += dist/speed; 
-                            Waypoint wp; wp.x=x2; wp.y=y2; wp.yaw=yaw2; wp.time=t;
-                            debug_waypoints.push_back(wp);
+                    if (rs_info.reason.find("Robot") != std::string::npos) {
+                        // This path is blocked by a robot, but geometerically valid.
+                        if (backup_result.status != PlanningStatus::BLOCKED_BY_ROBOT) { 
+                             backup_result.waypoints = extract_path(current, rs_path);
+                             backup_result.status = PlanningStatus::BLOCKED_BY_ROBOT;
+                             backup_result.colliding_entity = rs_info.entity_name;
+                             backup_result.failure_detail = "Blocked by " + rs_info.entity_name;
+                             backup_result.failure_time = rs_info.time;
                         }
-                        
-                        PlanningResult failed_res;
-                        failed_res.waypoints = debug_waypoints;
-
-                        visualize_planning_debug(
-                            *timetable, 
-                            robot, 
-                            failed_res, 
-                            current->t, 
-                            Pose(current->x, current->y, current->yaw), 
-                            Pose(goal->x, goal->y, goal->yaw), 
-                            params
-                        );
+                    } else {
+                         // Hard collision logic
+                         static int rs_fail_counter = 0;
+                         if (DEBUG_VIS && rs_fail_counter++ < 2) {
+                            std::cout << "\n[DEBUG TRAP] Analytic Path Rejected (Hard Collision) at t=" << rs_info.time << " due to " << rs_info.entity_name << std::endl;
+                            // ... can add visualization here if needed, keeping it simple for now
+                         }
                     }
                 }
             }
@@ -742,12 +743,21 @@ public:
             }
         }
 
+        if (backup_result.status == PlanningStatus::BLOCKED_BY_ROBOT) {
+            std::cout << "Returning backup path blocked by " << backup_result.colliding_entity << std::endl;
+            return backup_result;
+        }
+
         std::cout << "No path found" << std::endl;
         res.status = PlanningStatus::NO_PATH_FOUND;
         res.failure_detail = "Search exhausted without reaching goal.";
         res.explored_nodes = std::move(local_explored);  // Move to result on failure
         //return {};
         return res;
+    }
+
+    void set_ignore_other_robots(bool ignore) {
+        ignore_other_robots = ignore;
     }
 
     // this version is to be deprecated

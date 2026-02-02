@@ -8,6 +8,7 @@
 
 #include <Entities.h>
 #include <Utils.h>  // Added for mod2pi
+#include <CollisionUtils.h>
 
 class TimeTable {
 public:
@@ -192,21 +193,28 @@ public:
     // Returns the pointer to the blocking entity if found, otherwise nullptr.
     RobotMeta* get_blocking_robot(const Pose& target_pose, double t, TimeTable& timetable,
                                   double margin_m = 0.1) {
-        // 1. Define geometry of the target pose (The robot wanting to go there)
-        // We assume standard robot size for the check
-        double length = 0.3 + margin_m; // approx front len
-        double width = 0.3 + margin_m;
-        Corners target_c = get_corners(target_pose.x, target_pose.y, target_pose.yaw, length, 0.2, width);
+        // Setup geometry for the target pose (assuming standard robot dimensions)
+        OccuRect assumed_size;
+        assumed_size.front_length = 0.3;
+        assumed_size.rear_length = 0.2;
+        assumed_size.width = 0.3;
+        
+        // Apply margin as inflation
+        double inflation = 1.0 + (margin_m / assumed_size.front_length);
+        CollisionGeometry target_geom = setup_collision_geometry(target_pose, assumed_size, inflation);
 
-        // 2. Check against all robots in TimeTable
+        // Check against all robots in TimeTable
         auto others = timetable.get_poses(t);
         for(auto& [ent, ent_pose] : others) {
-            if (ent->type != EntityType::ROBOT) continue; // Only clear robots
+            if (ent->type != EntityType::ROBOT) continue; // Only check robots
 
-            Corners ent_c = get_corners(ent_pose.x, ent_pose.y, ent_pose.yaw,
-                                        ent->size.front_length, ent->size.rear_length, ent->size.width);
-
-            if (rectangles_intersect(target_c, ent_c)) {
+            // Create a minimal Params for collision checking
+            Params dummy_params;
+            dummy_params.inflation = 1.0;
+            dummy_params.safety_margin = 0.0;
+            
+            auto collision = check_entity_collision(target_geom, target_pose, ent, ent_pose, dummy_params);
+            if (collision.has_collision) {
                 return dynamic_cast<RobotMeta*>(ent);
             }
         }
