@@ -134,9 +134,12 @@ Pose calcRobotPoseFromObj(const Pose &obj_pose, const OccuRect &robot_size,
 // ==========================================
 // SMARTER DIAGNOSTIC FUNCTION
 // ==========================================
+// ==========================================
 void diagnose_planning_failure(RobotMeta *robot, const Pose &start,
                                const Pose &goal, double time,
-                               TimeTable &timetable) {
+                               TimeTable &timetable,
+                               const std::unordered_map<std::string, EntityMeta *> &entities,
+                               const Params &params) {
   std::cerr << "\n  [Diagnostics] Analyzing failure for " << robot->name
             << " at t=" << time << "s..." << std::endl;
 
@@ -145,6 +148,34 @@ void diagnose_planning_failure(RobotMeta *robot, const Pose &start,
                                                     others_map.end());
 
   // --- Helper Lambda: Is this a valid transfer? ---
+  // ... (existing lambda) ...
+
+  std::cout << "    Start: (" << start.x << ", " << start.y << ", " << start.yaw << ")" << std::endl;
+  std::cout << "    Goal:  (" << goal.x << ", " << goal.y << ", " << goal.yaw << ")" << std::endl;
+
+  // Cross-check with Planner's internal check
+  PHAStar diag_planner(robot, goal, &timetable, &entities, params, false, "", time);
+  // Note: start node is initialized in constructor from robot->initial_pose
+  if (diag_planner.start) {
+       auto col_info = diag_planner.check_collision_at(diag_planner.start.get());
+       std::cout << "    [Planner Check] Start Node Collision: " << (col_info.is_valid ? "VALID" : "COLLISION") << std::endl;
+       if (!col_info.is_valid) {
+           std::cout << "      Reason: " << col_info.reason 
+                     << ", Entity: " << col_info.entity_name << std::endl;
+       }
+       
+       // Also check Goal
+       Node goal_node(goal.x, goal.y, goal.yaw, time + 10.0, 0, 0, nullptr, 0); // Arbitrary future time
+       auto goal_info = diag_planner.check_collision_at(&goal_node);
+       std::cout << "    [Planner Check] Goal Node Collision: " << (goal_info.is_valid ? "VALID" : "COLLISION") << std::endl;
+       if (!goal_info.is_valid) {
+           std::cout << "      Reason: " << goal_info.reason 
+                     << ", Entity: " << goal_info.entity_name << std::endl;
+       }
+  } else {
+       std::cout << "    [Planner Check] Start Node is NULL (Init failed?)" << std::endl;
+  }
+
   auto is_valid_transfer = [](EntityMeta *e1, const Pose &p1, EntityMeta *e2,
                               const Pose &p2) -> bool {
     // 1. Identify Robot and Object
@@ -230,6 +261,8 @@ void diagnose_planning_failure(RobotMeta *robot, const Pose &start,
   std::cerr << "    [Info] Checking other entities for consistency..."
             << std::endl;
   bool global_issue = false;
+
+
   for (size_t i = 0; i < others.size(); ++i) {
     for (size_t j = i + 1; j < others.size(); ++j) {
       auto [ent1, p1] = others[i];
@@ -453,6 +486,11 @@ bool relocate_blocking_robot(RobotMeta* blocker,
         if (conflict) continue;
         
         PHAStar planner(blocker, cand.pose, &timetable, &entities, params, false, "", ready_time);
+        
+        // OPTIMIZATION: Set strict iteration limit for parking search.
+        // If a spot is hard to reach, it's likely bad. Fail fast and try next.
+        planner.max_search_iterations = 2000; 
+        
         auto res = planner.Planning_with_res(ready_time);
         
         if (res.status == PlanningStatus::SUCCESS) {
@@ -483,9 +521,10 @@ bool plan_initial_transit(
   Pose current_pose = timetable.get_pose(robot, start_time);
   robot->initial_pose = current_pose; // Update meta for planner
 
-  std::cout << "  [Transit] Planning " << robot->name << " -> ("
+  std::cout << "  [Transit] Planning " << robot->name << " -> Target ("
             << target_pose.x << ", " << target_pose.y << ", " << target_pose.yaw
-            << ") starting at " << start_time << "s" << std::endl;
+            << ") from Start (" << current_pose.x << ", " << current_pose.y << ", " << current_pose.yaw
+            << ") at " << start_time << "s" << std::endl;
 
   PHAStar planner(robot, target_pose, &timetable, &entities, params, false, "",
                   start_time);
@@ -516,6 +555,10 @@ bool plan_initial_transit(
                    // Restore absolute times for planner if we use it again? No, we create a new one.
                    PHAStar retry_planner(robot, target_pose, &timetable, &entities, params, false, "", start_time);
                    path_res = retry_planner.Planning_with_res(start_time);
+              } else {
+                   std::cerr << "  [Transit] Relocation FAILED. Discarding blocked path." << std::endl;
+                   path_res.waypoints.clear();
+                   path_res.status = PlanningStatus::NO_PATH_FOUND;
               }
           }
       }
@@ -561,7 +604,7 @@ bool plan_initial_transit(
     std::cerr << " [Error] Transit planning failed for " << robot->name
               << " - Status: " << static_cast<int>(path_res.status)
               << ", Detail: " << path_res.failure_detail << std::endl;
-    diagnose_planning_failure(robot, current_pose, target_pose, start_time, timetable);
+    diagnose_planning_failure(robot, current_pose, target_pose, start_time, timetable, entities, params);
     return false;
   }
 
@@ -626,6 +669,19 @@ RobotMeta *find_earliest_robot(const std::vector<RobotMeta *> &robots,
     }
   }
   return best_robot;
+}
+
+// Returns list of (robot, free_time) sorted by earliest free time
+std::vector<std::pair<RobotMeta*, double>> get_sorted_candidate_robots(
+    const std::vector<RobotMeta *> &robots, TimeTable &timetable) {
+  std::vector<std::pair<RobotMeta*, double>> candidates;
+  for (auto *robot : robots) {
+    double t = timetable.get_entity_max_time(robot);
+    candidates.emplace_back(robot, t);
+  }
+  std::sort(candidates.begin(), candidates.end(), 
+    [](const auto& a, const auto& b) { return a.second < b.second; });
+  return candidates;
 }
 
 /*
@@ -805,7 +861,7 @@ void schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
   timetable.add_trajectory(*traj);
 }
 
-void process_task_execution(
+bool process_task_execution(
     RobotMeta *robot, Task &task, TimeTable &timetable,
     const std::unordered_map<std::string, EntityMeta *> &entities,
     const Params &params) {
@@ -814,7 +870,7 @@ void process_task_execution(
   if (!plan_initial_transit(robot, task.TaskStartPoseRobot, robot_avail_time,
                             timetable, entities, params)) {
     std::cerr << "Aborting task due to transit failure." << std::endl;
-    return;
+    return false;
   }
 
   // 2. ObsRelo (if exists)
@@ -872,7 +928,7 @@ void process_task_execution(
         visualize_current_state(timetable, entities, params, segment_ready_time,
                                 start_pose, segment_goal);
       }
-      break;
+      return false; // Break logic was here, now return false
     }
 
     // C. Register Trajectory
@@ -887,6 +943,7 @@ void process_task_execution(
       append_retraction(robot, *path_ptr, timetable);
     }
   }
+  return true;
 }
 
 // ==========================================
@@ -929,30 +986,42 @@ int main(int argc, char **argv) {
 
   // --- 4. Task Allocation & Execution Loop ---
   int task_counter = 0;
+
   for (auto &task : tasks) {
     task_counter++;
     std::cout << "\n=== Processing Task " << task_counter << " ("
               << task.targetObject->name << ") ===" << std::endl;
 
-    // Assign Robot
-    double earliest_time;
-    RobotMeta *assigned_robot = task.assignedRobot;
+    // Generate candidate list sorted by availability
+    auto candidates = get_sorted_candidate_robots(all_robots, timetable);
 
-    if (!assigned_robot) {
-      assigned_robot =
-          find_earliest_robot(all_robots, timetable, earliest_time);
-      if (!assigned_robot) {
-        std::cerr << "[Error] No robots available." << std::endl;
-        continue;
-      }
-      task.assignedRobot = assigned_robot;
-      std::cout << "[Assign] Assigned " << assigned_robot->name
-                << " (Free at t=" << std::fixed << std::setprecision(2)
-                << earliest_time << "s)" << std::endl;
+    // If a robot was pre-assigned, prioritize it
+    if (task.assignedRobot) {
+        auto it = std::find_if(candidates.begin(), candidates.end(),
+            [&](const auto& p) { return p.first == task.assignedRobot; });
+        if (it != candidates.end()) {
+            std::rotate(candidates.begin(), it, it + 1);
+        }
     }
 
-    // Execute
-    process_task_execution(assigned_robot, task, timetable, entities, params);
+    bool task_success = false;
+    for (auto& [cand_robot, free_time] : candidates) {
+        task.assignedRobot = cand_robot; // Tentative assignment
+        std::cout << "[Assign] Attempting " << cand_robot->name 
+                  << " (Free at t=" << std::fixed << std::setprecision(2) << free_time << "s)" << std::endl;
+
+        if (process_task_execution(cand_robot, task, timetable, entities, params)) {
+             task_success = true;
+             std::cout << "[Assign] SUCCESS with " << cand_robot->name << std::endl;
+             break;
+        } else {
+             std::cout << "[Assign] FAILED with " << cand_robot->name << " (Transit Blocked) - Trying next..." << std::endl;
+        }
+    }
+
+    if (!task_success) {
+        std::cerr << "[Critical] Task " << task_counter << " failed with ALL available robots." << std::endl;
+    }
   }
 
   // --- 5. Visualization & Cleanup ---

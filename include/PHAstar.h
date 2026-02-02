@@ -44,7 +44,7 @@ struct Node {
 */
 
 class PHAStar {
-private:
+public:
     RobotMeta* robot;
     std::unique_ptr<Node> start, goal;
     TimeTable* timetable;
@@ -59,6 +59,9 @@ private:
     
     // Backup path (valid geometry but blocked by relocatable robot)
     PlanningResult backup_result;
+    
+    // Search limits
+    int max_search_iterations = 50000;
 
     // For diagnostics
     double max_planning_time = 10.0; // [s] timeout threshold (tune via params if needed)
@@ -566,10 +569,18 @@ public:
                           << ", current f-cost: " << std::get<0>(open_set.top()) << std::endl;
             }
 
-            // Early exit if we have a backup and search is taking too long
-            if (iteration > 50000 && backup_result.status == PlanningStatus::BLOCKED_BY_ROBOT) {
-                std::cout << "Hit iteration limit (50000) with backup path available. Returning backup." << std::endl;
-                return backup_result;
+            // Early exit if search is taking too long
+            if (iteration > (size_t)max_search_iterations) {
+                if (backup_result.status == PlanningStatus::BLOCKED_BY_ROBOT) {
+                    std::cout << "Hit iteration limit (" << max_search_iterations << ") with backup path. Returning backup." << std::endl;
+                    return backup_result;
+                } else {
+                     std::cout << "Hit iteration limit (" << max_search_iterations << ") with NO backup. Aborting." << std::endl;
+                     PlanningResult fail_res;
+                     fail_res.status = PlanningStatus::NO_PATH_FOUND;
+                     fail_res.failure_detail = "Search iteration limit exceeded";
+                     return fail_res;
+                }
             }
 
             auto [f, _, current] = open_set.top();
