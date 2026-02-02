@@ -537,31 +537,44 @@ bool plan_initial_transit(
       // We need a Trajectory object for relocate_blocking_robot
       Trajectory ghost_traj;
       ghost_traj.waypoints = path_res.waypoints;
+      ghost_traj.entity = robot; // FIX: Prevent segfault in collision check
       
-      // Need waypoints to be RELATIVE to 0 for check_collision... wait
-      // Actually relocate_blocking_robot and checking logic might prefer absolute?
-      // check_collision_trajectory_detailed uses relative times in waypoints.
-      double initial_t = ghost_traj.waypoints.front().time;
+      if (ghost_traj.waypoints.empty()) {
+          std::cerr << " [Error] Blocked path has no waypoints! Cannot relocate." << std::endl;
+          path_res.status = PlanningStatus::NO_PATH_FOUND;
+      } else {
+          // Need waypoints to be RELATIVE to 0 for check_collision... wait
+          // Actually relocate_blocking_robot and checking logic might prefer absolute?
+          // check_collision_trajectory_detailed uses relative times in waypoints.
+          double initial_t = ghost_traj.waypoints.front().time;
       for(auto& wp : ghost_traj.waypoints) wp.time -= initial_t;
       
       CollisionInfo col_info = check_collision_trajectory_detailed(ghost_traj, initial_t, timetable, params, false);
       
       if (!col_info.is_valid && !col_info.entity_name.empty()) {
-          EntityMeta* collider = entities.at(col_info.entity_name);
-          if (collider && collider->type == EntityType::ROBOT) {
-              RobotMeta* blocker = dynamic_cast<RobotMeta*>(collider);
-              if (relocate_blocking_robot(blocker, timetable, params, entities, &ghost_traj)) {
-                   std::cout << "  [Transit] Relocation successful. Retrying plan..." << std::endl;
-                   // Restore absolute times for planner if we use it again? No, we create a new one.
-                   PHAStar retry_planner(robot, target_pose, &timetable, &entities, params, false, "", start_time);
-                   path_res = retry_planner.Planning_with_res(start_time);
-              } else {
-                   std::cerr << "  [Transit] Relocation FAILED. Discarding blocked path." << std::endl;
-                   path_res.waypoints.clear();
-                   path_res.status = PlanningStatus::NO_PATH_FOUND;
+          // Safeguard: Check if entity exists in map (e.g., "Boundary" might not)
+          if (entities.count(col_info.entity_name)) {
+              EntityMeta* collider = entities.at(col_info.entity_name);
+              if (collider && collider->type == EntityType::ROBOT) {
+                  RobotMeta* blocker = dynamic_cast<RobotMeta*>(collider);
+                  if (relocate_blocking_robot(blocker, timetable, params, entities, &ghost_traj)) {
+                       std::cout << "  [Transit] Relocation successful. Retrying plan..." << std::endl;
+                       // Restore absolute times for planner if we use it again? No, we create a new one.
+                       PHAStar retry_planner(robot, target_pose, &timetable, &entities, params, false, "", start_time);
+                       path_res = retry_planner.Planning_with_res(start_time);
+                  } else {
+                       std::cerr << "  [Transit] Relocation FAILED. Discarding blocked path." << std::endl;
+                       path_res.waypoints.clear();
+                       path_res.status = PlanningStatus::NO_PATH_FOUND;
+                  }
               }
+          } else {
+              std::cerr << "  [Transit] Blocked by unknown entity/boundary (" << col_info.entity_name << "). Cannot relocate." << std::endl;
+              path_res.waypoints.clear();
+              path_res.status = PlanningStatus::NO_PATH_FOUND;
           }
       }
+  }
   }
 
   // Fallback for cases where standard planning finds nothing (Search exhausted)
@@ -577,24 +590,30 @@ bool plan_initial_transit(
          // 2. Identify blockers on the ghost path
          Trajectory ghost_traj;
          ghost_traj.waypoints = ghost_res.waypoints;
+         ghost_traj.entity = robot; // FIX: Prevent segfault in collision check
          double initial_t = ghost_traj.waypoints.front().time;
          for(auto& wp : ghost_traj.waypoints) wp.time -= initial_t;
          
          CollisionInfo col_info = check_collision_trajectory_detailed(ghost_traj, initial_t, timetable, params, false);
          
-         if (!col_info.is_valid && col_info.entity_name != "") {
-             EntityMeta* collider = entities.count(col_info.entity_name) ? entities.at(col_info.entity_name) : nullptr;
-             if (collider && collider->type == EntityType::ROBOT) {
-                 RobotMeta* blocker = dynamic_cast<RobotMeta*>(collider);
-                 
-                 // Restore absolute path for hint
-                 for(auto& wp : ghost_traj.waypoints) wp.time += initial_t;
-                 
-                 if (relocate_blocking_robot(blocker, timetable, params, entities, &ghost_traj)) {
-                      std::cout << "  [Transit] Relocation successful. Retrying plan..." << std::endl;
-                      PHAStar retry_planner(robot, target_pose, &timetable, &entities, params, false, "", start_time);
-                      path_res = retry_planner.Planning_with_res(start_time);
+         if (!col_info.is_valid && !col_info.entity_name.empty()) {
+             // Safeguard: Check if entity exists in map
+             if (entities.count(col_info.entity_name)) {
+                 EntityMeta* collider = entities.at(col_info.entity_name);
+                 if (collider && collider->type == EntityType::ROBOT) {
+                     RobotMeta* blocker = dynamic_cast<RobotMeta*>(collider);
+                     
+                     // Restore absolute path for hint
+                     for(auto& wp : ghost_traj.waypoints) wp.time += initial_t;
+                     
+                     if (relocate_blocking_robot(blocker, timetable, params, entities, &ghost_traj)) {
+                          std::cout << "  [Transit] Relocation successful. Retrying plan..." << std::endl;
+                          PHAStar retry_planner(robot, target_pose, &timetable, &entities, params, false, "", start_time);
+                          path_res = retry_planner.Planning_with_res(start_time);
+                     }
                  }
+             } else {
+                 std::cerr << "  [Transit] Ghost path blocked by unknown entity/boundary (" << col_info.entity_name << "). Cannot relocate." << std::endl;
              }
          }
      }
