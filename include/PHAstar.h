@@ -191,7 +191,17 @@ public:
         
         // Pre-compute robot geometry (constant along path)
         Pose dummy_pose = {0, 0, 0};
-        CollisionGeometry robot_geom = setup_collision_geometry(dummy_pose, robot->size, params.inflation);
+        
+        // Use temporary size for transfer to include the object
+        OccuRect check_size = robot->size;
+        if (is_transfer && transferred) {
+            // Extend front to cover the object
+            // effective_front = robot_front + object_rear + object_front
+            check_size.front_length += transferred->size.rear_length + transferred->size.front_length;
+            check_size.width = std::max(check_size.width, transferred->size.width);
+        }
+        
+        CollisionGeometry robot_geom = setup_collision_geometry(dummy_pose, check_size, params.inflation);
         
         for (int i = 1; i <= params.collision_steps; ++i) {
             double frac = static_cast<double>(i) / params.collision_steps;
@@ -216,7 +226,7 @@ public:
             Pose check_pose = {x_i, y_i, yaw_i};
             
             // Update geometry with actual pose
-            CollisionGeometry geom_at_pose = setup_collision_geometry(check_pose, robot->size, params.inflation);
+            CollisionGeometry geom_at_pose = setup_collision_geometry(check_pose, check_size, params.inflation);
             
             // Check bounds
             if (check_bounds_collision(geom_at_pose.corners, params.min_x, params.max_x, params.min_y, params.max_y)) {
@@ -330,18 +340,19 @@ public:
                     Node temp_node(x_i, y_i, yaw_i, t_i, 0, 0, nullptr, 1); // Cost/Steer irrelevant for collision
                     
                     CollisionInfo info = check_collision_at(&temp_node);
-                    if (!info.is_valid) {
-                         if (info.reason.find("Robot") != std::string::npos) {
-                             // Soft Collision: Record and Continue
-                             if (!robot_collision_found) {
-                                 robot_collision_found = true;
-                                 robot_col_info = info;
-                             }
-                         } else {
-                             // Hard Collision: Return Failure Immediately
-                             return info; 
-                         }
-                    }
+                     if (!info.is_valid) {
+                          // Only treat as Soft Collision if it's a Robot AND not the Boundary
+                          if (info.reason.find("Robot") != std::string::npos && info.entity_name != "Boundary") {
+                              // Soft Collision: Record and Continue
+                              if (!robot_collision_found) {
+                                  robot_collision_found = true;
+                                  robot_col_info = info;
+                              }
+                          } else {
+                              // Hard Collision: Return Failure Immediately
+                              return info; 
+                          }
+                     }
                 }
                 current_t += time_inc;
             }

@@ -22,7 +22,7 @@ struct Params {
     double analytic_threshold = 5.0;
     double rs_step_size = 0.2;
     double inflation = 1.0;
-    double safety_margin = 0.00;
+    double safety_margin = 0.01;
     double movement_length = 0.0;  // Added back for dynamic calculation
 
     double final_push_distance = 0.025;
