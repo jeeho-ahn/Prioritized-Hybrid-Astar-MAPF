@@ -624,98 +624,132 @@ public:
             auto [rs_path, rs_length] = analytic_expand(current);
             if (!rs_path.empty())
             {
-                CollisionInfo rs_info = check_collision_along_rs(rs_path, current->t);
-                if (rs_info.is_valid)
-                {
-                    auto waypoints = extract_path(current, rs_path);
-                    double arrival_t = waypoints.back().time;
 
-                    // Post-arrival check
-                    bool post_safe = true;
-                    bool post_blocked_by_robot = false;
-                    CollisionInfo post_arrival_collision;
+                // Lambda to check full path validity with a given start time offset
+                auto check_full_path = [&](double start_time_offset) -> std::pair<bool, CollisionInfo> {
+                    double current_check_time = current->t + start_time_offset;
+                    
+                    // Check RS path
+                    CollisionInfo rs_check = check_collision_along_rs(rs_path, current_check_time);
+                    if (!rs_check.is_valid) return {false, rs_check};
+
+                    // Check post-arrival
+                    auto waypoints_temp = extract_path(current, rs_path);
+                    // Adjust waypoint times for offset
+                    for(auto& wp : waypoints_temp) wp.time += start_time_offset;
+                    
+                    double arrival_t = waypoints_temp.back().time;
                     for (double future_t = arrival_t + params.time_step; future_t <= params.max_time; future_t += params.time_step)
                     {
                         Node dummy(goal->x, goal->y, goal->yaw, future_t, 0.0, 0.0, nullptr, 0);
-                        auto collision_result = check_collision_at(&dummy);
-                        if (!collision_result.is_valid)
-                        {
-                            post_safe = false;
-                            post_arrival_collision = collision_result;
-                            if (collision_result.reason.find("Robot") != std::string::npos) {
-                                post_blocked_by_robot = true;
-                            }
-                            break;
-                        }
+                        auto col = check_collision_at(&dummy);
+                        if (!col.is_valid) return {false, col};
                     }
+                    return {true, {true, "Valid", ""}};
+                };
 
-                    if (post_safe)
-                    {
-                        std::cout << "Goal found with analytic expansion!" << std::endl;
-                        return {waypoints, PlanningStatus::SUCCESS, ""};
-                    }
-                    else if (post_blocked_by_robot)
-                    {
-                        // Blocked at goal by a robot. Save as backup.
-                        if (backup_result.status != PlanningStatus::BLOCKED_BY_ROBOT) {
-                             backup_result.waypoints = waypoints;
-                             backup_result.status = PlanningStatus::BLOCKED_BY_ROBOT;
-                             backup_result.colliding_entity = post_arrival_collision.entity_name;
-                             backup_result.failure_detail = "Blocked at goal by " + post_arrival_collision.entity_name;
-                             backup_result.failure_time = post_arrival_collision.time;
-                        }
-                    }
-                    else // Hard collision in post-safe check
-                    {
-                        static int post_fail_counter = 0;
-                        if (DEBUG_VIS && post_fail_counter++ < 2) {
-                            std::cout << "\n[DEBUG TRAP] Analytic Post-Arrival Rejected (Hard Collision)" << std::endl;
-                            std::cout << "  > Reason: " << post_arrival_collision.reason << std::endl;
-                            std::cout << "  > Entity: " << post_arrival_collision.entity_name << std::endl;
-                        }
-                        
-                        // Construct a temporary Failed Result to visualize
-                        PlanningResult failed_res;
-                        failed_res.waypoints = waypoints;
+                // Initial check
+                auto [initial_valid, initial_info] = check_full_path(0.0);
 
-                        auto current_pose = Pose(current->x,current->y,current->yaw);
-                        auto goal_pose = Pose(goal->x,goal->y,goal->yaw);
-                        
-                        // Call the visualizer immediately
-                        visualize_planning_debug(
-                            *timetable, 
-                            robot, 
-                            failed_res, 
-                            post_arrival_collision.time,
-                            current_pose,
-                            goal_pose, 
-                            params
-                        );
-                    }
-                }
-                else  // CollisionInfo (rs_info) not valid
+                if (initial_valid)
                 {
-                    if (rs_info.reason.find("Robot") != std::string::npos) {
-                        // This path is blocked by a robot, but geometerically valid.
-                        if (backup_result.status != PlanningStatus::BLOCKED_BY_ROBOT) { 
-                             backup_result.waypoints = extract_path(current, rs_path);
-                             backup_result.status = PlanningStatus::BLOCKED_BY_ROBOT;
-                             backup_result.colliding_entity = rs_info.entity_name;
-                             backup_result.failure_detail = "Blocked by " + rs_info.entity_name;
-                             backup_result.failure_time = rs_info.time;
+                    auto waypoints = extract_path(current, rs_path);
+                    std::cout << "Goal found with analytic expansion!" << std::endl;
+                    return {waypoints, PlanningStatus::SUCCESS, ""};
+                }
+                else
+                {
+                    // If blocked by a moving Robot/Object, try to wait
+                    if ((initial_info.reason.find("Robot") != std::string::npos || 
+                         initial_info.reason.find("Object") != std::string::npos) && 
+                         initial_info.entity_name != "Boundary")
+                    {
+                        // Check if blocking entity is moving (active)
+                        EntityMeta* blocker = nullptr;
+                        // Find entity pointer by name (inefficient but safe)
+                        for(auto& [name, ent] : *entities) {
+                            if (name == initial_info.entity_name) {
+                                blocker = ent;
+                                break;
+                            }
                         }
-                    } else {
-                         // Hard collision logic
-                         static int rs_fail_counter = 0;
-                         if (DEBUG_VIS && rs_fail_counter++ < 2) {
-                            std::cout << "\n[DEBUG TRAP] Analytic Path Rejected (Hard Collision) at t=" << rs_info.time << " due to " << rs_info.entity_name << std::endl;
-                            // ... can add visualization here if needed, keeping it simple for now
-                         }
+
+                        if (blocker) {
+                            double blocker_end_time = timetable->get_entity_max_time(blocker);
+                            // If blocking entity is still moving after the collision time, it's worth waiting
+                            if (blocker_end_time > initial_info.time) {
+                                
+                                double max_wait = 30.0; // Max wait duration
+                                double wait_step = 1.5; // Coarser step for efficiency
+
+                                
+                                for (double wait_t = wait_step; wait_t <= max_wait; wait_t += wait_step) {
+                                    auto [delayed_valid, _] = check_full_path(wait_t);
+                                    if (delayed_valid) {
+                                        std::cout << "  [Delay] Found valid path with " << wait_t << "s delay." << std::endl;
+                                        
+                                        
+                                        // 1. Get path from Start to Current
+                                        std::vector<Waypoint> waypoints = extract_path(current, {});
+                                        
+                                        // 2. Wait at current
+                                        double current_end_time = waypoints.back().time;
+                                        for(double t = params.time_step; t <= wait_t; t += params.time_step) {
+                                            Waypoint w;
+                                            w.x = current->x; w.y = current->y; w.yaw = current->yaw;
+                                            w.time = current_end_time + t;
+                                            w.linear_velocity = 0; w.steering_angle = 0;
+                                            waypoints.push_back(w);
+                                        }
+
+                                        // 3. Append analytic path (re-generated for full details)
+                                        // We need to re-run RS planning to get steer/dir, just like extract_path does
+                                        auto [rs_x, rs_y, rs_yaw, rs_ctypes, rs_lengths, rs_steers, rs_directions] = ReedShepp::reeds_shepp_path_planning(
+                                            current->x, current->y, current->yaw, goal->x, goal->y, goal->yaw, max_curvature, params.rs_step_size, wheel_base
+                                        );
+                                        
+                                        double rs_t = waypoints.back().time;
+                                        for (size_t i = 1; i < rs_x.size(); ++i) {
+                                            double dist = std::hypot(rs_x[i] - rs_x[i-1], rs_y[i] - rs_y[i-1]);
+                                            rs_t += dist / speed;
+                                            Waypoint w;
+                                            w.time = rs_t;
+                                            w.x = rs_x[i];
+                                            w.y = rs_y[i];
+                                            w.yaw = rs_yaw[i];
+                                            w.linear_velocity = rs_directions[i] * speed;
+                                            w.steering_angle = rs_steers[i];
+                                            waypoints.push_back(w);
+                                        }
+                                        
+                                        return {waypoints, PlanningStatus::SUCCESS, ""};
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Fallback to backup logic if wait didn't work or wasn't applicable
+                    if (initial_info.reason.find("Robot") != std::string::npos) {
+                        if (backup_result.status != PlanningStatus::BLOCKED_BY_ROBOT) {
+                            backup_result.waypoints = extract_path(current, rs_path);
+                            backup_result.status = PlanningStatus::BLOCKED_BY_ROBOT;
+                            backup_result.colliding_entity = initial_info.entity_name;
+                            backup_result.failure_detail = "Blocked by " + initial_info.entity_name;
+                            backup_result.failure_time = initial_info.time;
+                        }
+                    }
+                    else {
+                        // Hard collision
+                        static int rs_fail_counter = 0;
+                        if (DEBUG_VIS && rs_fail_counter++ < 2) {
+                             std::cout << "\n[DEBUG TRAP] Analytic Path Rejected (Hard Collision) at t=" << initial_info.time << " due to " << initial_info.entity_name << std::endl;
+                        }
                     }
                 }
-            }
+            } // End rs_path analysis
 
-            // Goal check (assuming near-goal threshold)
+            // Goal check (assuming near-goal threshold) - logic remains standard
             double dist_to_goal = std::hypot(current->x - goal->x, current->y - goal->y);
             double dyaw_to_goal = std::fabs(mod2pi(current->yaw - goal->yaw));
             if (dist_to_goal < params.xy_resolution && dyaw_to_goal < params.yaw_resolution)
@@ -724,6 +758,9 @@ public:
                 double arrival_t = waypoints.back().time;
 
                 bool post_safe = true;
+                bool blocked_by_robot = false;
+                std::string blocker_name;
+
                 for (double future_t = arrival_t + params.time_step; future_t <= params.max_time; future_t += params.time_step)
                 {
                     Node dummy(goal->x, goal->y, goal->yaw, future_t, 0.0, 0.0, nullptr, 0);
@@ -731,6 +768,10 @@ public:
                     if (!is_collision_free.is_valid)
                     {
                         post_safe = false;
+                        if (is_collision_free.reason.find("Robot") != std::string::npos) {
+                             blocked_by_robot = true;
+                             blocker_name = is_collision_free.entity_name;
+                        }
                         break;
                     }
                 }
@@ -738,12 +779,21 @@ public:
                 if (post_safe)
                 {
                     std::cout << "Goal found!" << std::endl;
-                    //return {waypoints, PlanningStatus::SUCCESS, ""};
                     res.waypoints = waypoints;
                     res.status = PlanningStatus::SUCCESS;
                     return res;
                 }
-                // Else continue
+                // Use new delay logic for goal arrival too? 
+                // Currently only implemented for Analytic Expansion (which covers most cases including near-goal if rs_path is short)
+                // But specifically for "arrived at goal but future is blocked":
+                else if (blocked_by_robot) {
+                     // Check if effective to wait AT GOAL? No, we are already AT goal.
+                     // The issue is we arrived too early?
+                     // If we are at goal, we just need to stay valid.
+                     // If future is blocked, it means a robot comes and hits us.
+                     // We should probably have waited BEFORE arriving.
+                     // But Standard A* would have generated wait nodes if helpful.
+                }
             }
 
             for (auto prim : motion_primitives)
@@ -777,6 +827,7 @@ public:
         //return {};
         return res;
     }
+
 
     void set_ignore_other_robots(bool ignore) {
         ignore_other_robots = ignore;
