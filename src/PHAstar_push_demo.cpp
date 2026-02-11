@@ -12,15 +12,19 @@
 #include <Task.h>
 #include <Visualization.h>
 #include <CollisionUtils.h>
+#include <LNSTypes.h>
 #include <config.h>
 #include <iomanip>
 #include <iostream>
 
-// for finding parking
+// for finding parking & LNS
 #include <algorithm>
 #include <cmath>
 #include <limits>
 #include <random>
+#include <set>
+#include <numeric>
+
 
 
 const bool DEBUG_VIS = false;
@@ -160,16 +164,16 @@ void diagnose_planning_failure(RobotMeta *robot, const Pose &start,
        auto col_info = diag_planner.check_collision_at(diag_planner.start.get());
        std::cout << "    [Planner Check] Start Node Collision: " << (col_info.is_valid ? "VALID" : "COLLISION") << std::endl;
        if (!col_info.is_valid) {
-           std::cout << "      Reason: " << col_info.reason 
+           std::cout << "      Reason: " << col_info.reason
                      << ", Entity: " << col_info.entity_name << std::endl;
        }
-       
+
        // Also check Goal
        Node goal_node(goal.x, goal.y, goal.yaw, time + 10.0, 0, 0, nullptr, 0); // Arbitrary future time
        auto goal_info = diag_planner.check_collision_at(&goal_node);
        std::cout << "    [Planner Check] Goal Node Collision: " << (goal_info.is_valid ? "VALID" : "COLLISION") << std::endl;
        if (!goal_info.is_valid) {
-           std::cout << "      Reason: " << goal_info.reason 
+           std::cout << "      Reason: " << goal_info.reason
                      << ", Entity: " << goal_info.entity_name << std::endl;
        }
   } else {
@@ -313,8 +317,7 @@ generate_parking_candidates(const Pose &current_pose, RobotMeta *robot,
   std::vector<ParkingCandidate> candidates;
 
   double maxc = 1.0 / robot->min_turning_radius;
-  double step_size = 0.2; // Can be coarse; only used for discretization (we
-                          // ignore the full path)
+  double step_size = 0.2;
   double wb = robot->wheel_base;
 
   auto compute_rs_length = [&](const Pose &goal) -> double {
@@ -333,44 +336,38 @@ generate_parking_candidates(const Pose &current_pose, RobotMeta *robot,
     return L;
   };
 
-  // 1. Strongly prefer the robot's initial_pose (often designed to be
-  // safe/clear)
+  // 1. Robot's initial_pose (often designed to be safe)
   double init_L = compute_rs_length(robot->initial_pose);
   candidates.push_back({robot->initial_pose, init_L});
 
-  // 2. Workspace corners with multiple orientations (out-of-the-way locations)
-  double margin = 0.6; // Safe margin from exact bounds
-  std::vector<double> corner_yaws = {0.0, M_PI / 2, M_PI, -M_PI / 2};
-  std::vector<std::pair<double, double>> corner_positions = {
-      {params.min_x + margin, params.min_y + margin},
-      {params.max_x - margin, params.min_y + margin},
-      {params.max_x - margin, params.max_y - margin},
-      {params.min_x + margin, params.max_y - margin}};
-
-  for (const auto &pos : corner_positions) {
-    for (double yaw : corner_yaws) {
-      Pose p{pos.first, pos.second, yaw};
-      double L = compute_rs_length(p);
-      candidates.push_back({p, L});
-    }
+  // 2. Workspace corners — only 1 orientation each (facing inward)
+  double margin = 0.6;
+  std::vector<std::pair<Pose, double>> corner_list = {
+      {{params.min_x + margin, params.min_y + margin, M_PI/4}, 0},   // bottom-left
+      {{params.max_x - margin, params.min_y + margin, 3*M_PI/4}, 0}, // bottom-right
+      {{params.max_x - margin, params.max_y - margin, -3*M_PI/4}, 0},// top-right
+      {{params.min_x + margin, params.max_y - margin, -M_PI/4}, 0},  // top-left
+  };
+  for (auto &[p, L] : corner_list) {
+    L = compute_rs_length(p);
+    candidates.push_back({p, L});
   }
 
-  // 3. Random samples as fallback (20-30 is plenty)
-  std::random_device rd;
-  std::mt19937 gen(rd());
-  std::uniform_real_distribution<> x_dist(params.min_x + margin,
-                                          params.max_x - margin);
-  std::uniform_real_distribution<> y_dist(params.min_y + margin,
-                                          params.max_y - margin);
-  std::uniform_real_distribution<> yaw_dist(-M_PI, M_PI);
-
-  for (int i = 0; i < 25; ++i) {
-    Pose p{x_dist(gen), y_dist(gen), yaw_dist(gen)};
+  // 3. Nearby spots at ~1.5m radius (quick moves to clear the area)
+  double radius = 1.5;
+  for (int i = 0; i < 8; i++) {
+    double angle = i * M_PI / 4.0;
+    double nx = current_pose.x + radius * std::cos(angle);
+    double ny = current_pose.y + radius * std::sin(angle);
+    // Clamp to workspace bounds
+    nx = std::max(params.min_x + margin, std::min(params.max_x - margin, nx));
+    ny = std::max(params.min_y + margin, std::min(params.max_y - margin, ny));
+    Pose p{nx, ny, angle + M_PI}; // Face back toward original position
     double L = compute_rs_length(p);
     candidates.push_back({p, L});
   }
 
-  // Sort by Reeds-Shepp length (lower is better). INF goes to the end.
+  // Sort by Reeds-Shepp length (lower is better)
   std::sort(candidates.begin(), candidates.end(),
             [](const ParkingCandidate &a, const ParkingCandidate &b) {
               return a.estimated_rs_length < b.estimated_rs_length;
@@ -397,7 +394,7 @@ CollisionInfo check_collision_trajectory_detailed(const Trajectory &traj, double
                                 bool verbose = false) {
   if (traj.waypoints.empty())
     return {true, "Empty Trajectory", "", start_time};
-    
+
   double dt = 0.1;
   double duration = traj.waypoints.back().time;
 
@@ -417,7 +414,7 @@ CollisionInfo check_collision_trajectory_detailed(const Trajectory &traj, double
     Pose obj_pose;
     const CollisionGeometry* obj_geom_ptr = nullptr;
     const Pose* obj_pose_ptr = nullptr;
-    
+
     if (traj.is_transfer && object) {
       double offset = robot->size.front_length + object->size.rear_length;
       obj_pose = {r_pose.x + offset * std::cos(r_pose.yaw),
@@ -450,49 +447,49 @@ CollisionInfo check_collision_trajectory_detailed(const Trajectory &traj, double
   return {true, "Valid", "", 0.0};
 }
 
-bool relocate_blocking_robot(RobotMeta* blocker, 
-                             TimeTable& timetable, 
+bool relocate_blocking_robot(RobotMeta* blocker,
+                             TimeTable& timetable,
                              const Params& params,
                              const std::unordered_map<std::string, EntityMeta*>& entities,
                              const Trajectory* blocked_traj_hint = nullptr) {
-    
+
     double ready_time = timetable.get_entity_max_time(blocker);
     // Add small buffer to start time to ensure no conflict with previous finish
-    ready_time += 0.1; 
-    
+    ready_time += 0.1;
+
     Pose start_pose = timetable.get_pose(blocker, ready_time);
     blocker->initial_pose = start_pose;
 
-    std::cout << "  [Relocate] Attempting to move " << blocker->name 
+    std::cout << "  [Relocate] Attempting to move " << blocker->name
               << " from (" << start_pose.x << ", " << start_pose.y << ")" << std::endl;
 
     auto candidates = generate_parking_candidates(start_pose, blocker, params);
-    
+
     for (const auto& cand : candidates) {
         bool conflict = false;
         if (blocked_traj_hint) {
-            Corners cand_corners = get_corners(cand.pose.x, cand.pose.y, cand.pose.yaw, 
+            Corners cand_corners = get_corners(cand.pose.x, cand.pose.y, cand.pose.yaw,
                                              blocker->size.front_length, blocker->size.rear_length, blocker->size.width);
             for (size_t i = 0; i < blocked_traj_hint->waypoints.size(); i += 5) {
                 const auto& wp = blocked_traj_hint->waypoints[i];
-                Corners wp_corners = get_corners(wp.x, wp.y, wp.yaw, 
-                                               blocker->size.front_length, blocker->size.rear_length, blocker->size.width); 
+                Corners wp_corners = get_corners(wp.x, wp.y, wp.yaw,
+                                               blocker->size.front_length, blocker->size.rear_length, blocker->size.width);
                 if (rectangles_intersect(cand_corners, wp_corners)) {
-                    conflict = true; 
+                    conflict = true;
                     break;
                 }
             }
         }
         if (conflict) continue;
-        
+
         PHAStar planner(blocker, cand.pose, &timetable, &entities, params, false, "", ready_time);
-        
-        // OPTIMIZATION: Set strict iteration limit for parking search.
-        // If a spot is hard to reach, it's likely bad. Fail fast and try next.
-        planner.max_search_iterations = 2000; 
-        
+
+        // OPTIMIZATION: Low iteration limit for parking search.
+        // Parking moves should be short. If a spot needs many iterations, skip it.
+        planner.max_search_iterations = 500;
+
         auto res = planner.Planning_with_res(ready_time);
-        
+
         if (res.status == PlanningStatus::SUCCESS) {
             Trajectory relo_traj;
             relo_traj.entity = blocker;
@@ -501,7 +498,7 @@ bool relocate_blocking_robot(RobotMeta* blocker,
              for (auto &wp : relo_traj.waypoints)
                 wp.time -= ready_time;
             timetable.add_trajectory(relo_traj);
-            std::cout << "  [Relocate] SUCCESS: Moved " << blocker->name 
+            std::cout << "  [Relocate] SUCCESS: Moved " << blocker->name
                       << " to (" << cand.pose.x << ", " << cand.pose.y << ")" << std::endl;
             return true;
         }
@@ -533,12 +530,12 @@ bool plan_initial_transit(
   // If blocked by robot, we already have a "ghost" path in path_res.waypoints
   if (path_res.status == PlanningStatus::BLOCKED_BY_ROBOT) {
       std::cout << "  [Transit] Path blocked by robot " << path_res.colliding_entity << ". Attempting relocation..." << std::endl;
-      
+
       // We need a Trajectory object for relocate_blocking_robot
       Trajectory ghost_traj;
       ghost_traj.waypoints = path_res.waypoints;
       ghost_traj.entity = robot; // FIX: Prevent segfault in collision check
-      
+
       if (ghost_traj.waypoints.empty()) {
           std::cerr << " [Error] Blocked path has no waypoints! Cannot relocate." << std::endl;
           path_res.status = PlanningStatus::NO_PATH_FOUND;
@@ -548,9 +545,9 @@ bool plan_initial_transit(
           // check_collision_trajectory_detailed uses relative times in waypoints.
           double initial_t = ghost_traj.waypoints.front().time;
       for(auto& wp : ghost_traj.waypoints) wp.time -= initial_t;
-      
+
       CollisionInfo col_info = check_collision_trajectory_detailed(ghost_traj, initial_t, timetable, params, false);
-      
+
       if (!col_info.is_valid && !col_info.entity_name.empty()) {
           // Safeguard: Check if entity exists in map (e.g., "Boundary" might not)
           if (entities.count(col_info.entity_name)) {
@@ -580,12 +577,12 @@ bool plan_initial_transit(
   // Fallback for cases where standard planning finds nothing (Search exhausted)
   if (path_res.waypoints.empty()) {
      std::cerr << " [Transit] Standard planning failed. Attempting to resolve blocking robots with full Ghost Planning..." << std::endl;
-     
+
      // 1. Attempt Ghost Planning (Ignore other robots)
      PHAStar ghost_planner(robot, target_pose, &timetable, &entities, params, false, "", start_time);
      ghost_planner.set_ignore_other_robots(true);
      auto ghost_res = ghost_planner.Planning_with_res(start_time);
-     
+
      if (ghost_res.status == PlanningStatus::SUCCESS) {
          // 2. Identify blockers on the ghost path
          Trajectory ghost_traj;
@@ -593,19 +590,19 @@ bool plan_initial_transit(
          ghost_traj.entity = robot; // FIX: Prevent segfault in collision check
          double initial_t = ghost_traj.waypoints.front().time;
          for(auto& wp : ghost_traj.waypoints) wp.time -= initial_t;
-         
+
          CollisionInfo col_info = check_collision_trajectory_detailed(ghost_traj, initial_t, timetable, params, false);
-         
+
          if (!col_info.is_valid && !col_info.entity_name.empty()) {
              // Safeguard: Check if entity exists in map
              if (entities.count(col_info.entity_name)) {
                  EntityMeta* collider = entities.at(col_info.entity_name);
                  if (collider && collider->type == EntityType::ROBOT) {
                      RobotMeta* blocker = dynamic_cast<RobotMeta*>(collider);
-                     
+
                      // Restore absolute path for hint
                      for(auto& wp : ghost_traj.waypoints) wp.time += initial_t;
-                     
+
                      if (relocate_blocking_robot(blocker, timetable, params, entities, &ghost_traj)) {
                           std::cout << "  [Transit] Relocation successful. Retrying plan..." << std::endl;
                           PHAStar retry_planner(robot, target_pose, &timetable, &entities, params, false, "", start_time);
@@ -629,7 +626,7 @@ bool plan_initial_transit(
 
   if (DEBUG_VIS) {
     std::cout << "[Debug] Visualizing Plan..." << std::endl;
-        
+
     visualize_planning_debug(
             timetable,           // Global history/future of others
             robot,  // The robot executing this plan
@@ -640,7 +637,7 @@ bool plan_initial_transit(
             params
         );
   }
-  
+
 
   // add final push
   double delta_t = params.final_push_distance / robot->speed_transit;
@@ -698,7 +695,7 @@ std::vector<std::pair<RobotMeta*, double>> get_sorted_candidate_robots(
     double t = timetable.get_entity_max_time(robot);
     candidates.emplace_back(robot, t);
   }
-  std::sort(candidates.begin(), candidates.end(), 
+  std::sort(candidates.begin(), candidates.end(),
     [](const auto& a, const auto& b) { return a.second < b.second; });
   return candidates;
 }
@@ -745,20 +742,28 @@ current_pose, target_pose);
 // Attempts to find a collision-free time slot for a trajectory segment
 double find_safe_start_time(Trajectory *traj, double earliest_start,
                             TimeTable &timetable, const Params &params,
-                            const std::unordered_map<std::string, EntityMeta *> &entities) {
+                            const std::unordered_map<std::string, EntityMeta *> &entities,
+                            std::string* out_blocking_entity = nullptr) {
   double check_time = earliest_start;
   double step = 0.5;
   int max_retries = 200; // ~100 seconds wait limit
-  
+
   std::string last_relocated_robot = "";
   double last_relocation_time = -100.0;
+  int relocation_attempts = 0;
+  const int max_relocation_attempts = 2; // Cap total relocations per call
 
   for (int i = 0; i < max_retries; ++i) {
     CollisionInfo col_info = check_collision_trajectory_detailed(*traj, check_time, timetable, params, false);
-    
+
     if (col_info.is_valid) {
         if (i > 0) std::cout << "  [Delay] Delayed " << (i * step) << "s for safety." << std::endl;
         return check_time;
+    }
+    
+    // Capture blocking entity
+    if (out_blocking_entity && !col_info.entity_name.empty()) {
+        *out_blocking_entity = col_info.entity_name;
     }
 
     // Handle Collision
@@ -770,21 +775,25 @@ double find_safe_start_time(Trajectory *traj, double earliest_start,
     if (collider && collider->type == EntityType::ROBOT) {
         RobotMeta* blocker = dynamic_cast<RobotMeta*>(collider);
         double blocker_free_time = timetable.get_entity_max_time(blocker);
-        
+
         if (col_info.time > blocker_free_time) {
             // Blocker is stationary/idle. Move it!
-            if (blocker->name != last_relocated_robot || (check_time - last_relocation_time > 5.0)) {
-                
-                if (relocate_blocking_robot(blocker, timetable, params, entities, traj)) {
+            if (relocation_attempts < max_relocation_attempts &&
+                (blocker->name != last_relocated_robot || (check_time - last_relocation_time > 5.0))) {
+
+                bool success = relocate_blocking_robot(blocker, timetable, params, entities, traj);
+                relocation_attempts++; // Count attempt regardless of outcome
+
+                if (success) {
                     last_relocated_robot = blocker->name;
                     last_relocation_time = check_time;
                     // Retry this time step (decrement so next loop increment checks same time)
-                    check_time -= step; 
+                    check_time -= step;
                 }
             }
         }
     }
-    
+
     check_time += step;
   }
 
@@ -855,15 +864,17 @@ void append_retraction(RobotMeta *robot, const Trajectory &previous_traj,
 // ==========================================
 
 // Helper function to handle the scheduling of a single path segment
+// (with optional conflict tracking)
 void schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
                            RobotMeta *robot, TimeTable &timetable,
                            const Params &params,
-                           const std::unordered_map<std::string, EntityMeta *> &entities) {
+                           const std::unordered_map<std::string, EntityMeta *> &entities,
+                           std::vector<ConflictRecord> *conflicts = nullptr,
+                           int task_index = -1) {
   // 1. Get current available time from the timetable
   double current_avail_time = timetable.get_entity_max_time(robot);
 
   // 2. Convert EdgePath to Trajectory
-  // ReloPushPath2TrajPtr is defined in Task.h
   TrajectoryPtr traj =
       ReloPushPath2TrajPtr(edge_path, robot, obj_meta, current_avail_time);
 
@@ -872,37 +883,61 @@ void schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
   traj->CalcualteTimeStamps(robot);
 
   // 3. Find safe start time
+  std::string blocker_name = "";
   double safe_start_time =
-      find_safe_start_time(traj.get(), current_avail_time, timetable, params, entities);
+      find_safe_start_time(traj.get(), current_avail_time, timetable, params, entities, &blocker_name);
+
+  // Track temporal dependency if delay was significant
+  if (conflicts && safe_start_time > current_avail_time + 1.0) {
+    ConflictRecord cr;
+    cr.type = ConflictType::TEMPORAL_DELAY_VICTIM;
+    cr.task_index = task_index;
+    cr.robot_name = robot->name;
+    cr.blocking_entity = blocker_name;
+    cr.blocking_task_index = -1;
+    cr.time = current_avail_time;
+    cr.detail = "Segment delayed by " + std::to_string(safe_start_time - current_avail_time) + "s";
+    if (!blocker_name.empty()) cr.detail += " (blocked by " + blocker_name + ")";
+    conflicts->push_back(cr);
+  }
 
   // 4. Update timestamps and add to timetable
   traj->start_time = safe_start_time;
-
-  // CalcualteTimeStamps is defined in Entities.h
   traj->CalcualteTimeStamps(robot);
-
   timetable.add_trajectory(*traj);
 }
 
+// Process task execution with conflict tracking
 bool process_task_execution(
     RobotMeta *robot, Task &task, TimeTable &timetable,
     const std::unordered_map<std::string, EntityMeta *> &entities,
-    const Params &params) {
+    const Params &params,
+    std::vector<ConflictRecord> *conflicts = nullptr,
+    int task_index = -1) {
   // 1. Plan Transit to Task Start
   double robot_avail_time = timetable.get_entity_max_time(robot);
   if (!plan_initial_transit(robot, task.TaskStartPoseRobot, robot_avail_time,
                             timetable, entities, params)) {
     std::cerr << "Aborting task due to transit failure." << std::endl;
+    // Track as deadlock conflict
+    if (conflicts) {
+      ConflictRecord cr;
+      cr.type = ConflictType::DEADLOCK_VICTIM;
+      cr.task_index = task_index;
+      cr.robot_name = robot->name;
+      cr.blocking_entity = "";
+      cr.blocking_task_index = -1;
+      cr.time = robot_avail_time;
+      cr.detail = "Transit planning failed completely";
+      conflicts->push_back(cr);
+    }
     return false;
   }
 
   // 2. ObsRelo (if exists)
   if (task.vertexChain.size() > 2) {
-    // Iterate through obstacles
     for (size_t obs_ind = 1; obs_ind < task.vertexChain.size() - 1; obs_ind++) {
       std::cout << "Obstacle Relocation" << std::endl;
-
-      // Identify the obstacle
       std::string obs_name = task.vertexChain[obs_ind].name;
       auto obs_meta = entities.at(obs_name);
 
@@ -910,13 +945,10 @@ bool process_task_execution(
       size_t post_path_idx = 1;
 
       if (task.obsReloPaths->size() > post_path_idx) {
-        // Step A: Two-point push trajectory
         schedule_path_segment(task.obsReloPaths->at(push_path_idx), obs_meta,
-                              robot, timetable, params, entities);
-
-        // Step B: Schedule the "Post-Obs/Return" path
+                              robot, timetable, params, entities, conflicts, task_index);
         schedule_path_segment(task.obsReloPaths->at(post_path_idx), obs_meta,
-                              robot, timetable, params, entities);
+                              robot, timetable, params, entities, conflicts, task_index);
       } else {
         std::cerr << "Error: obsReloPaths missing required paths for index "
                   << obs_ind << std::endl;
@@ -930,38 +962,61 @@ bool process_task_execution(
     segment_idx++;
     double segment_ready_time = timetable.get_entity_max_time(robot);
 
-    // Prepare Trajectory Object
     path_ptr->entity = robot;
-    path_ptr->CalcualteTimeStamps(
-        robot); // Reset internal relative times based on robot constraints
+    path_ptr->CalcualteTimeStamps(robot);
 
     Pose segment_goal = path_ptr->waypoints.back();
 
-    // B. Find Valid Start Time (Collision Delay)
     std::cout << "  [Segment " << segment_idx << "] Checking schedule..."
               << std::endl;
+    std::string blocker_name = "";
     double safe_start_time = find_safe_start_time(
-        path_ptr.get(), segment_ready_time, timetable, params, entities);
-    if (safe_start_time < 0) { // Or if waypoints.empty() after any re-plan
+        path_ptr.get(), segment_ready_time, timetable, params, entities, &blocker_name);
+    if (safe_start_time < 0) {
       std::cerr << " [Error] Segment " << segment_idx
                 << " failed (permanent blockage or empty path)" << std::endl;
       if (DEBUG_VIS) {
-        Pose start_pose = timetable.get_pose(
-            robot, segment_ready_time); // Current at ready time
+        Pose start_pose = timetable.get_pose(robot, segment_ready_time);
         visualize_current_state(timetable, entities, params, segment_ready_time,
                                 start_pose, segment_goal);
       }
-      return false; // Break logic was here, now return false
+      // Track as deadlock
+      if (conflicts) {
+        ConflictRecord cr;
+        cr.type = ConflictType::DEADLOCK_VICTIM;
+        cr.task_index = task_index;
+        cr.robot_name = robot->name;
+        cr.blocking_entity = blocker_name;
+        cr.blocking_task_index = -1;
+        cr.time = segment_ready_time;
+        cr.detail = "Segment " + std::to_string(segment_idx) + " permanently blocked";
+        if (!blocker_name.empty()) cr.detail += " by " + blocker_name;
+        conflicts->push_back(cr);
+      }
+      return false;
     }
 
-    // C. Register Trajectory
+    // Track temporal delay
+    if (conflicts && safe_start_time > segment_ready_time + 1.0) {
+      ConflictRecord cr;
+      cr.type = ConflictType::TEMPORAL_DELAY_VICTIM;
+      cr.task_index = task_index;
+      cr.robot_name = robot->name;
+      cr.blocking_entity = blocker_name;
+      cr.blocking_task_index = -1;
+      cr.time = segment_ready_time;
+      cr.detail = "Edge segment " + std::to_string(segment_idx) + " delayed by " +
+                  std::to_string(safe_start_time - segment_ready_time) + "s";
+      if (!blocker_name.empty()) cr.detail += " (blocked by " + blocker_name + ")";
+      conflicts->push_back(cr);
+    }
+
     path_ptr->start_time = safe_start_time;
-    path_ptr->is_transfer = path_ptr->is_transfer; // Explicit for clarity
+    path_ptr->is_transfer = path_ptr->is_transfer;
     path_ptr->transferred_object =
         path_ptr->is_transfer ? path_ptr->transferred_object : nullptr;
     timetable.add_trajectory(*path_ptr);
 
-    // D. Handle Retraction (if this was a push)
     if (path_ptr->is_transfer) {
       append_retraction(robot, *path_ptr, timetable);
     }
@@ -969,8 +1024,582 @@ bool process_task_execution(
   return true;
 }
 
+
 // ==========================================
-// 4. MAIN ENTRY POINT
+// 4. ALLOCATION RUNNER (for LNS)
+// ==========================================
+
+// Pre-parks idle robots to safe locations before the task loop.
+// Robots whose first assigned task comes late in the sequence sit idle at their
+// initial positions and can block transit paths for other robots. This function
+// moves them to safe workspace corners preemptively — mimicking how greedy
+// allocation naturally assigns idle robots first so they move out of the way.
+void pre_park_idle_robots(
+    const std::vector<std::string> &robot_assignment,
+    const std::vector<RobotMeta *> &robots,
+    TimeTable &timetable,
+    const std::unordered_map<std::string, EntityMeta *> &entities,
+    const Params &params,
+    bool verbose) {
+
+  int num_robots = static_cast<int>(robots.size());
+
+  // Skip pre-parking in greedy mode (all assignments empty)
+  bool has_forced_assignment = false;
+  for (const auto &a : robot_assignment) {
+    if (!a.empty()) { has_forced_assignment = true; break; }
+  }
+  if (!has_forced_assignment) return;
+
+  // Find each robot's first assigned task index
+  std::unordered_map<std::string, int> first_task_idx;
+  for (const auto *r : robots) {
+    first_task_idx[r->name] = -1; // -1 = not assigned to any task
+  }
+  for (size_t i = 0; i < robot_assignment.size(); i++) {
+    const auto &rname = robot_assignment[i];
+    if (!rname.empty() && first_task_idx.count(rname) &&
+        first_task_idx[rname] < 0) {
+      first_task_idx[rname] = static_cast<int>(i);
+    }
+  }
+
+  // Safe parking corners (spread across workspace)
+  double margin = 0.6;
+  std::vector<Pose> safe_spots = {
+      {params.min_x + margin, params.min_y + margin, 0.0},           // bottom-left
+      {params.max_x - margin, params.min_y + margin, M_PI},          // bottom-right
+      {params.max_x - margin, params.max_y - margin, M_PI},          // top-right
+      {params.min_x + margin, params.max_y - margin, 0.0},           // top-left
+  };
+
+  int spot_idx = 0;
+  for (auto *robot : robots) {
+    int first_task = first_task_idx[robot->name];
+
+    // If robot's first task is late (after the first num_robots tasks),
+    // or robot has no assigned task at all, pre-park it
+    if (first_task < 0 || first_task >= num_robots) {
+      // Pick a safe spot that's different from the robot's current position
+      Pose target = safe_spots[spot_idx % safe_spots.size()];
+      spot_idx++;
+
+      double ready_time = timetable.get_entity_max_time(robot);
+      Pose current = timetable.get_pose(robot, ready_time);
+
+      // Skip if robot is already near the target
+      double dist = std::hypot(current.x - target.x, current.y - target.y);
+      if (dist < 0.5) continue;
+
+      if (verbose) {
+        std::cout << "  [Pre-park] Moving idle " << robot->name
+                  << " from (" << current.x << ", " << current.y
+                  << ") to safe corner (" << target.x << ", " << target.y
+                  << ")" << std::endl;
+      }
+
+      robot->initial_pose = current;
+      PHAStar planner(robot, target, &timetable, &entities, params, false, "",
+                      ready_time);
+      planner.max_search_iterations = 3000;
+      auto res = planner.Planning_with_res(ready_time);
+
+      if (res.status == PlanningStatus::SUCCESS && !res.waypoints.empty()) {
+        Trajectory park_traj;
+        park_traj.entity = robot;
+        park_traj.start_time = ready_time;
+        park_traj.waypoints = res.waypoints;
+        for (auto &wp : park_traj.waypoints)
+          wp.time -= ready_time;
+        timetable.add_trajectory(park_traj);
+
+        if (verbose) {
+          std::cout << "  [Pre-park] " << robot->name << " parked successfully."
+                    << std::endl;
+        }
+      } else {
+        if (verbose) {
+          std::cout << "  [Pre-park] " << robot->name
+                    << " parking failed (will relocate on demand)." << std::endl;
+        }
+      }
+    }
+  }
+}
+
+// Runs the full task allocation with a given robot assignment.
+// robot_assignment[task_i] = robot name for the preferred robot.
+// If "", the greedy (earliest-free) heuristic is used.
+// Returns an AllocationSolution with conflict records.
+AllocationSolution run_allocation(
+    const std::vector<FinalAllocation> &loadedSequence,
+    const std::vector<std::string> &robot_assignment,
+    const Params &params_template,
+    bool verbose = true) {
+
+  // --- Fresh environment for each allocation run ---
+  Params params = params_template;
+  auto entities = initialize_entities(loadedSequence);
+  TimeTable timetable(0.5);
+  timetable.add_initial(entities);
+
+  // Build robot pointer list (fresh copies)
+  std::vector<RobotMeta *> robots;
+  for (const auto &[name, ent] : entities) {
+    if (ent->type == EntityType::ROBOT)
+      robots.push_back(dynamic_cast<RobotMeta *>(ent));
+  }
+
+  // Build fresh tasks
+  std::vector<Task> tasks;
+  for (const auto &fa : loadedSequence) {
+    tasks.emplace_back(fa, entities);
+  }
+
+  // Pre-park idle robots to prevent blocking early tasks
+  pre_park_idle_robots(robot_assignment, robots, timetable, entities, params,
+                       verbose);
+
+  AllocationSolution solution;
+  solution.robot_assignment.resize(tasks.size(), "");
+  int task_counter = 0;
+
+  for (size_t ti = 0; ti < tasks.size(); ti++) {
+    task_counter++;
+    auto &task = tasks[ti];
+
+    if (verbose) {
+      std::cout << "\n=== Processing Task " << task_counter << " ("
+                << task.targetObject->name << ") ===" << std::endl;
+    }
+
+    // Build candidate list
+    auto candidates = get_sorted_candidate_robots(robots, timetable);
+
+    // If we have a preferred robot assignment, prioritize it
+    if (ti < robot_assignment.size() && !robot_assignment[ti].empty()) {
+      std::string preferred_name = robot_assignment[ti];
+      auto it = std::find_if(candidates.begin(), candidates.end(),
+          [&](const auto &p) { return p.first->name == preferred_name; });
+      if (it != candidates.end()) {
+        std::rotate(candidates.begin(), it, it + 1);
+      }
+    }
+
+    TaskAllocationResult result;
+    result.task_index = static_cast<int>(ti);
+    result.success = false;
+    result.completion_time = 0.0;
+    
+    // Track mapping from robot name to its last successful task index
+    static std::unordered_map<std::string, int> robot_last_task_idx;
+    if (ti == 0) robot_last_task_idx.clear(); // Clear on first task of allocation run
+
+    for (auto &[cand_robot, free_time] : candidates) {
+      task.assignedRobot = cand_robot;
+      if (verbose) {
+        std::cout << "[Assign] Attempting " << cand_robot->name
+                  << " (Free at t=" << std::fixed << std::setprecision(2)
+                  << free_time << "s)" << std::endl;
+      }
+
+      std::vector<ConflictRecord> task_conflicts;
+
+      if (process_task_execution(cand_robot, task, timetable, entities, params,
+                                 &task_conflicts, static_cast<int>(ti))) {
+        result.success = true;
+        result.robot_name = cand_robot->name;
+        result.completion_time = timetable.get_entity_max_time(cand_robot);
+        result.conflicts = task_conflicts;
+
+        // Record which robot was used (by name for determinism)
+        solution.robot_assignment[ti] = cand_robot->name;
+        robot_last_task_idx[cand_robot->name] = static_cast<int>(ti);
+
+        // RETROACTIVE LABELING: Check for TEMPORAL conflicts and blame the blocker
+        for (const auto& c : task_conflicts) {
+            if (c.type == ConflictType::TEMPORAL_DELAY_VICTIM && !c.blocking_entity.empty()) {
+                if (robot_last_task_idx.count(c.blocking_entity)) {
+                    int last_idx = robot_last_task_idx[c.blocking_entity];
+                    if (last_idx >= 0 && last_idx < solution.results.size()) {
+                        ConflictRecord retro_cr;
+                        retro_cr.type = ConflictType::TEMPORAL_DELAY_CAUSE;
+                        retro_cr.task_index = last_idx;
+                        retro_cr.robot_name = c.blocking_entity;
+                        retro_cr.blocking_task_index = static_cast<int>(ti); // Caused delay here
+                        retro_cr.time = solution.results[last_idx].completion_time;
+                        retro_cr.detail = "Caused delay for Task " + std::to_string(ti) +
+                                          " (" + c.detail + ")";
+                        
+                        // Avoid duplicates if possible? simple vector push is fine for now
+                        solution.results[last_idx].conflicts.push_back(retro_cr);
+                    }
+                }
+            }
+        }
+
+        if (verbose) {
+          std::cout << "[Assign] SUCCESS with " << cand_robot->name << std::endl;
+        }
+        break;
+      } else {
+        // Record the failure attempt
+        ConflictRecord cr;
+        cr.type = ConflictType::PHYSICAL_BLOCK_VICTIM; // Default
+        
+        // Enhance: Check if it was a DEADLOCK from transit failure
+        bool is_deadlock = false;
+        for(const auto& c : task_conflicts) {
+            if (c.type == ConflictType::DEADLOCK_VICTIM) {
+                is_deadlock = true;
+                cr.type = ConflictType::DEADLOCK_VICTIM;
+                cr.detail = c.detail;
+                break;
+            }
+        }
+        
+        if (!is_deadlock) {
+             cr.detail = "Robot " + cand_robot->name + " failed execution";
+        }
+
+        cr.task_index = static_cast<int>(ti);
+        cr.robot_name = cand_robot->name;
+        cr.blocking_entity = "";
+        cr.blocking_task_index = -1;
+        cr.time = free_time;
+        
+        task_conflicts.push_back(cr);
+        result.conflicts = task_conflicts;
+
+        // RETROACTIVE LABELING:
+        // If this robot is DEADLOCKED/TRAPPED, blame the previous task
+        if (is_deadlock && robot_last_task_idx.count(cand_robot->name)) {
+            int last_idx = robot_last_task_idx[cand_robot->name];
+            if (last_idx >= 0 && last_idx < solution.results.size()) {
+                 ConflictRecord retro_cr;
+                 retro_cr.type = ConflictType::DEADLOCK_CAUSE;
+                 retro_cr.task_index = last_idx;
+                 retro_cr.robot_name = cand_robot->name;
+                 retro_cr.blocking_task_index = static_cast<int>(ti); // Caused failure here
+                 retro_cr.time = solution.results[last_idx].completion_time;
+                 retro_cr.detail = "Ended in trap state, causing failure in Task " + std::to_string(ti);
+                 
+                 solution.results[last_idx].conflicts.push_back(retro_cr);
+            }
+        }
+
+        if (verbose) {
+          std::cout << "[Assign] FAILED with " << cand_robot->name
+                    << " (Transit/Exec Failed) - Trying next..." << std::endl;
+        }
+      }
+    }
+
+    if (!result.success) {
+      if (verbose) {
+        std::cerr << "[Critical] Task " << task_counter
+                  << " failed with ALL available robots." << std::endl;
+      }
+      // EARLY EXIT: If a task fails completely, the solution is invalid/worse. 
+      // Stop wasting time on this iteration.
+      solution.results.push_back(result);
+      solution.failed_tasks++;
+      // We still return the partial solution so LNS can count it as a failure, 
+      // but we shouldn't compute the rest.
+      break; 
+    }
+
+    solution.results.push_back(result);
+  }
+
+  solution.compute_stats();
+
+
+  // Cleanup fresh entities
+  for (auto &pair : entities)
+    delete pair.second;
+
+  return solution;
+}
+
+
+// ==========================================
+// 5. LARGE NEIGHBORHOOD SEARCH
+// ==========================================
+
+void print_solution_summary(const AllocationSolution &sol, const std::string &label) {
+  std::cout << "\n--- " << label << " ---" << std::endl;
+  std::cout << "  Makespan: " << std::fixed << std::setprecision(2) << sol.makespan << "s" << std::endl;
+  std::cout << "  Failed tasks: " << sol.failed_tasks << " / " << sol.results.size() << std::endl;
+  std::cout << "  Total conflicts: " << sol.total_conflicts << std::endl;
+  std::cout << "  Assignment: [";
+  for (size_t i = 0; i < sol.robot_assignment.size(); i++) {
+    if (i > 0) std::cout << ", ";
+    std::cout << sol.robot_assignment[i];
+  }
+  std::cout << "]" << std::endl;
+
+  // Print per-task details
+  for (const auto &r : sol.results) {
+    std::string status = r.success ? "OK" : "FAIL";
+    std::cout << "  Task " << r.task_index << ": " << status
+              << " by " << r.robot_name
+              << " (t=" << std::fixed << std::setprecision(2) << r.completion_time << "s)"
+              << " conflicts=" << r.conflicts.size() << std::endl;
+    for (const auto &c : r.conflicts) {
+      std::string type_str;
+      switch (c.type) {
+        case ConflictType::PHYSICAL_BLOCK_VICTIM: type_str = "BLOCKED"; break;
+        case ConflictType::PHYSICAL_BLOCK_CAUSE: type_str = "BLOCKING"; break;
+        case ConflictType::TEMPORAL_DELAY_VICTIM: type_str = "DELAYED"; break;
+        case ConflictType::TEMPORAL_DELAY_CAUSE: type_str = "CAUSED_DELAY"; break;
+        case ConflictType::DEADLOCK_VICTIM: type_str = "DEADLOCK_VICTIM"; break;
+        case ConflictType::DEADLOCK_CAUSE: type_str = "DEADLOCK_CAUSE"; break;
+      }
+      std::cout << "    *** [" << type_str << "] " << c.detail << std::endl;
+    }
+  }
+}
+
+// Compare two solutions: returns true if 'candidate' is better than 'current'
+bool is_better_solution(const AllocationSolution &candidate, const AllocationSolution &current) {
+  // Priority 1: Fewer failed tasks
+  if (candidate.failed_tasks != current.failed_tasks)
+    return candidate.failed_tasks < current.failed_tasks;
+  // Priority 2: Lower makespan
+  if (std::abs(candidate.makespan - current.makespan) > 0.5)
+    return candidate.makespan < current.makespan;
+  // Priority 3: Fewer conflicts
+  return candidate.total_conflicts < current.total_conflicts;
+}
+
+AllocationSolution run_lns(
+    const std::vector<FinalAllocation> &loadedSequence,
+    const std::vector<std::string> &robot_names,
+    const Params &params,
+    const AllocationSolution &initial_solution,
+    int max_iterations = 50) {
+
+  int num_robots = static_cast<int>(robot_names.size());
+
+  std::mt19937 rng(42); // Fixed seed for reproducibility
+  int num_tasks = static_cast<int>(initial_solution.robot_assignment.size());
+
+  AllocationSolution best = initial_solution;
+  AllocationSolution current = initial_solution;
+
+  std::cout << "\n========================================" << std::endl;
+  std::cout << " STARTING LARGE NEIGHBORHOOD SEARCH" << std::endl;
+  std::cout << "========================================" << std::endl;
+  print_solution_summary(best, "Initial Solution (Greedy)");
+
+  for (int iter = 0; iter < max_iterations; iter++) {
+    std::cout << "\n--- LNS Iteration " << (iter + 1) << "/" << max_iterations
+              << " ---" << std::endl;
+
+    // === DESTROY: Select which tasks to re-assign ===
+    std::set<int> destroyed_tasks;
+    int destroy_strategy = iter % 6; // Cycle through 6 strategies
+
+    if (destroy_strategy == 0) {
+      // Strategy 1: Random removal (2-4 tasks)
+      std::uniform_int_distribution<int> k_dist(2, std::min(4, num_tasks));
+      int k = k_dist(rng);
+      std::vector<int> indices(num_tasks);
+      std::iota(indices.begin(), indices.end(), 0);
+      std::shuffle(indices.begin(), indices.end(), rng);
+      for (int i = 0; i < k; i++) {
+        destroyed_tasks.insert(indices[i]);
+      }
+      std::cout << "[LNS] Destroy strategy: RANDOM (" << k << " tasks)" << std::endl;
+
+    } else if (destroy_strategy == 1) {
+      // Strategy 2: Conflict-guided (tasks with most conflicts + neighbors)
+      int worst_task = -1;
+      int worst_conflicts = -1;
+      for (const auto &r : current.results) {
+        int nc = static_cast<int>(r.conflicts.size());
+        if (!r.success) nc += 10;
+        if (nc > worst_conflicts) {
+          worst_conflicts = nc;
+          worst_task = r.task_index;
+        }
+      }
+      if (worst_task >= 0) {
+        destroyed_tasks.insert(worst_task);
+        if (worst_task > 0) destroyed_tasks.insert(worst_task - 1);
+        if (worst_task < num_tasks - 1) destroyed_tasks.insert(worst_task + 1);
+      }
+      std::cout << "[LNS] Destroy strategy: CONFLICT-GUIDED" << std::endl;
+
+    } else if (destroy_strategy == 2) {
+      // Strategy 3: Robot-targeted (unassign all tasks from one robot)
+      std::uniform_int_distribution<int> robot_dist(0, num_robots - 1);
+      int target_idx = robot_dist(rng);
+      std::string target_robot_name = robot_names[target_idx];
+      for (int t = 0; t < num_tasks; t++) {
+        if (current.robot_assignment[t] == target_robot_name) {
+          destroyed_tasks.insert(t);
+        }
+      }
+      std::cout << "[LNS] Destroy strategy: ROBOT-TARGETED (" << target_robot_name << ")" << std::endl;
+
+    } else if (destroy_strategy == 3) {
+      // Strategy 4: BLOCKING Conflict Targeting
+      // Destroy tasks that faced PHYSICAL BLOCKING (VICTIM) or CAUSED it
+      for (const auto &r : current.results) {
+        for (const auto &c : r.conflicts) {
+          if (c.type == ConflictType::PHYSICAL_BLOCK_VICTIM || c.type == ConflictType::PHYSICAL_BLOCK_CAUSE) {
+            destroyed_tasks.insert(r.task_index);
+            if (c.blocking_task_index >= 0) destroyed_tasks.insert(c.blocking_task_index);
+          }
+        }
+      }
+      if (destroyed_tasks.empty() && !current.results.empty()) {
+          // Fallback if no specific blocking conflicts
+          destroyed_tasks.insert(rng() % num_tasks);
+      }
+      std::cout << "[LNS] Destroy strategy: BLOCKING-GUIDED" << std::endl;
+
+    } else if (destroy_strategy == 4) {
+      // Strategy 5: TEMPORAL Conflict Targeting
+      for (const auto &r : current.results) {
+        for (const auto &c : r.conflicts) {
+          if (c.type == ConflictType::TEMPORAL_DELAY_VICTIM || c.type == ConflictType::TEMPORAL_DELAY_CAUSE) {
+            destroyed_tasks.insert(r.task_index);
+            if (c.blocking_task_index >= 0) destroyed_tasks.insert(c.blocking_task_index);
+          }
+        }
+      }
+      if (destroyed_tasks.empty() && !current.results.empty()) {
+          destroyed_tasks.insert(rng() % num_tasks);
+      }
+      std::cout << "[LNS] Destroy strategy: TEMPORAL-GUIDED" << std::endl;
+
+    } else {
+      // Strategy 6: DEADLOCK / Failure Targeting
+      for (const auto &r : current.results) {
+        if (!r.success) destroyed_tasks.insert(r.task_index);
+        for (const auto &c : r.conflicts) {
+          if (c.type == ConflictType::DEADLOCK_VICTIM || c.type == ConflictType::DEADLOCK_CAUSE) {
+            destroyed_tasks.insert(r.task_index);
+            if (c.blocking_task_index >= 0) destroyed_tasks.insert(c.blocking_task_index);
+          }
+        }
+      }
+      if (destroyed_tasks.empty() && !current.results.empty()) {
+          destroyed_tasks.insert(rng() % num_tasks);
+      }
+      std::cout << "[LNS] Destroy strategy: DEADLOCK-GUIDED" << std::endl;
+    }
+
+    if (destroyed_tasks.empty()) {
+      std::cout << "[LNS] No tasks destroyed, skipping iteration." << std::endl;
+      continue;
+    }
+
+    std::cout << "[LNS] Destroyed tasks: {";
+    for (auto it = destroyed_tasks.begin(); it != destroyed_tasks.end(); ++it) {
+      if (it != destroyed_tasks.begin()) std::cout << ", ";
+      std::cout << *it;
+    }
+    std::cout << "}" << std::endl;
+
+    // === REPAIR: Build new assignment ===
+    // Keep non-destroyed tasks at their current assignment
+    std::vector<std::string> new_assignment = current.robot_assignment;
+
+    // Constraint: Load Balancing (max tasks per robot = ceil(avg) + 2)
+    // +2 allows some flexibility while preventing extreme imbalance (e.g. 7 vs 0)
+    int max_tasks_per_robot = (num_tasks / num_robots) + 2;
+
+    // Count current assignments for non-destroyed tasks
+    std::unordered_map<std::string, int> task_counts;
+    for (int t = 0; t < num_tasks; t++) {
+        if (destroyed_tasks.find(t) == destroyed_tasks.end()) {
+             task_counts[new_assignment[t]]++;
+        }
+    }
+
+    std::vector<int> destroyed_vec(destroyed_tasks.begin(), destroyed_tasks.end());
+    // Shuffle destroyed tasks to avoid bias in assignment order
+    std::shuffle(destroyed_vec.begin(), destroyed_vec.end(), rng);
+
+    for (int t : destroyed_vec) {
+      // Find robots that aren't overloaded
+      std::vector<int> valid_robot_indices;
+      for(int r=0; r<num_robots; ++r) {
+          if (task_counts[robot_names[r]] < max_tasks_per_robot) {
+              valid_robot_indices.push_back(r);
+          }
+      }
+
+      // Fallback: if all valid are overloaded (shouldn't happen with sufficient buffer), use all
+      if (valid_robot_indices.empty()) {
+          for(int r=0; r<num_robots; ++r) valid_robot_indices.push_back(r);
+      }
+
+      std::uniform_int_distribution<> rob_dist(0, valid_robot_indices.size() - 1);
+      int new_idx = valid_robot_indices[rob_dist(rng)];
+      std::string new_robot_name = robot_names[new_idx];
+
+      // Try to ensure change if possible (unless only 1 valid robot)
+      if (new_robot_name == current.robot_assignment[t] && valid_robot_indices.size() > 1) {
+          // If we picked the same one, try again (simple retry)
+          new_idx = valid_robot_indices[rob_dist(rng)];
+          new_robot_name = robot_names[new_idx];
+      }
+
+      new_assignment[t] = new_robot_name;
+      task_counts[new_robot_name]++;
+    }
+
+    std::cout << "[LNS] New assignment: [";
+    for (size_t i = 0; i < new_assignment.size(); i++) {
+      if (i > 0) std::cout << ", ";
+      if (destroyed_tasks.count(static_cast<int>(i))) {
+        std::cout << "\033[1;33m" << new_assignment[i] << "\033[0m"; // Highlight changed
+      } else {
+        std::cout << new_assignment[i];
+      }
+    }
+    std::cout << "]" << std::endl;
+
+    // === EVALUATE: Run full allocation with new assignment ===
+    AllocationSolution candidate = run_allocation(
+        loadedSequence, new_assignment, params, false /*verbose*/);
+
+    std::cout << "[LNS] Candidate: makespan=" << std::fixed << std::setprecision(2)
+              << candidate.makespan << "s, failed=" << candidate.failed_tasks
+              << ", conflicts=" << candidate.total_conflicts << std::endl;
+
+    // === ACCEPT/REJECT ===
+    if (is_better_solution(candidate, current)) {
+      std::cout << "[LNS] ACCEPTED (improvement)" << std::endl;
+      current = candidate;
+      if (is_better_solution(candidate, best)) {
+        best = candidate;
+        std::cout << "[LNS] *** NEW BEST SOLUTION ***" << std::endl;
+      }
+    } else {
+      std::cout << "[LNS] Rejected (no improvement)" << std::endl;
+    }
+
+    std::cout << "[LNS] Current best: makespan=" << std::fixed << std::setprecision(2)
+              << best.makespan << "s, failed=" << best.failed_tasks << std::endl;
+  }
+
+  std::cout << "\n========================================" << std::endl;
+  std::cout << " LNS COMPLETE" << std::endl;
+  std::cout << "========================================" << std::endl;
+  print_solution_summary(best, "Best Solution (LNS)");
+
+  return best;
+}
+
+
+// ==========================================
+// 6. MAIN ENTRY POINT
 // ==========================================
 
 int main(int argc, char **argv) {
@@ -989,66 +1618,99 @@ int main(int argc, char **argv) {
   // --- 2. Initialize Environment ---
   Params params = initialize_params(loadedSequence);
   auto entities = initialize_entities(loadedSequence);
-  TimeTable timetable(0.5);
-  timetable.add_initial(entities);
 
-  // Identify Robots
-  std::vector<RobotMeta *> all_robots;
+  // Identify Robots and build sorted name list for deterministic ordering
+  std::vector<std::string> robot_names;
   for (const auto &[name, ent] : entities) {
     if (ent->type == EntityType::ROBOT)
-      all_robots.push_back(dynamic_cast<RobotMeta *>(ent));
+      robot_names.push_back(name);
+  }
+  std::sort(robot_names.begin(), robot_names.end());
+  int num_robots = static_cast<int>(robot_names.size());
+  int num_tasks = static_cast<int>(loadedSequence.size());
+
+  std::cout << "[System] " << num_robots << " robots, " << num_tasks << " tasks." << std::endl;
+
+  // --- 3. Run Greedy Allocation (Initial Solution) ---
+  std::cout << "\n========================================" << std::endl;
+  std::cout << " PHASE 1: GREEDY ALLOCATION" << std::endl;
+  std::cout << "========================================" << std::endl;
+
+  // Use empty strings for all tasks (let greedy decide)
+  std::vector<std::string> greedy_assignment(num_tasks, "");
+  AllocationSolution greedy_solution = run_allocation(
+      loadedSequence, greedy_assignment, params, true);
+
+  print_solution_summary(greedy_solution, "Greedy Solution");
+
+
+
+  // --- 4. Run LNS Improvement ---
+  std::cout << "\n========================================" << std::endl;
+  std::cout << " PHASE 2: LNS IMPROVEMENT" << std::endl;
+  std::cout << "========================================" << std::endl;
+
+  AllocationSolution best_solution = run_lns(
+      loadedSequence, robot_names, params, greedy_solution,
+      /*max_iterations=*/50);
+
+  // --- 5. Print Improvement Summary ---
+  std::cout << "\n========================================" << std::endl;
+  std::cout << " IMPROVEMENT SUMMARY" << std::endl;
+  std::cout << "========================================" << std::endl;
+  std::cout << "  Greedy makespan:  " << std::fixed << std::setprecision(2) << greedy_solution.makespan << "s" << std::endl;
+  std::cout << "  LNS best makespan: " << best_solution.makespan << "s" << std::endl;
+  double improvement = greedy_solution.makespan - best_solution.makespan;
+  double pct = (greedy_solution.makespan > 0) ? (improvement / greedy_solution.makespan * 100.0) : 0.0;
+  std::cout << "  Improvement: " << improvement << "s (" << std::setprecision(1) << pct << "%)" << std::endl;
+  std::cout << "  Greedy failed: " << greedy_solution.failed_tasks << ", LNS failed: " << best_solution.failed_tasks << std::endl;
+  std::cout << "  Greedy conflicts: " << greedy_solution.total_conflicts << ", LNS conflicts: " << best_solution.total_conflicts << std::endl;
+
+  // --- 6. Re-run best solution for visualization ---
+  std::cout << "\n[System] Re-running best solution for visualization..." << std::endl;
+
+  // Re-initialize for final visualization run
+  for (auto &pair : entities)
+    delete pair.second;
+  entities = initialize_entities(loadedSequence);
+  TimeTable final_timetable(0.5);
+  final_timetable.add_initial(entities);
+
+  std::vector<RobotMeta *> viz_robots;
+  for (const auto &[name, ent] : entities) {
+    if (ent->type == EntityType::ROBOT)
+      viz_robots.push_back(dynamic_cast<RobotMeta *>(ent));
   }
 
-  // --- 3. Initialize Tasks ---
-  std::vector<Task> tasks;
+  std::vector<Task> viz_tasks;
   for (const auto &fa : loadedSequence) {
-    tasks.emplace_back(fa, entities);
+    viz_tasks.emplace_back(fa, entities);
   }
-  std::cout << "[System] Initialized " << tasks.size() << " tasks."
-            << std::endl;
 
-  // --- 4. Task Allocation & Execution Loop ---
-  int task_counter = 0;
+  // Re-run with best assignment
+  for (size_t ti = 0; ti < viz_tasks.size(); ti++) {
+    auto &task = viz_tasks[ti];
+    auto candidates = get_sorted_candidate_robots(viz_robots, final_timetable);
 
-  for (auto &task : tasks) {
-    task_counter++;
-    std::cout << "\n=== Processing Task " << task_counter << " ("
-              << task.targetObject->name << ") ===" << std::endl;
-
-    // Generate candidate list sorted by availability
-    auto candidates = get_sorted_candidate_robots(all_robots, timetable);
-
-    // If a robot was pre-assigned, prioritize it
-    if (task.assignedRobot) {
-        auto it = std::find_if(candidates.begin(), candidates.end(),
-            [&](const auto& p) { return p.first == task.assignedRobot; });
-        if (it != candidates.end()) {
-            std::rotate(candidates.begin(), it, it + 1);
-        }
+    if (ti < best_solution.robot_assignment.size() &&
+        !best_solution.robot_assignment[ti].empty()) {
+      std::string preferred_name = best_solution.robot_assignment[ti];
+      auto it = std::find_if(candidates.begin(), candidates.end(),
+          [&](const auto &p) { return p.first->name == preferred_name; });
+      if (it != candidates.end()) {
+        std::rotate(candidates.begin(), it, it + 1);
+      }
     }
 
-    bool task_success = false;
-    for (auto& [cand_robot, free_time] : candidates) {
-        task.assignedRobot = cand_robot; // Tentative assignment
-        std::cout << "[Assign] Attempting " << cand_robot->name 
-                  << " (Free at t=" << std::fixed << std::setprecision(2) << free_time << "s)" << std::endl;
-
-        if (process_task_execution(cand_robot, task, timetable, entities, params)) {
-             task_success = true;
-             std::cout << "[Assign] SUCCESS with " << cand_robot->name << std::endl;
-             break;
-        } else {
-             std::cout << "[Assign] FAILED with " << cand_robot->name << " (Transit Blocked) - Trying next..." << std::endl;
-        }
-    }
-
-    if (!task_success) {
-        std::cerr << "[Critical] Task " << task_counter << " failed with ALL available robots." << std::endl;
+    for (auto &[cand_robot, free_time] : candidates) {
+      task.assignedRobot = cand_robot;
+      if (process_task_execution(cand_robot, task, final_timetable, entities, params)) {
+        break;
+      }
     }
   }
 
-  // --- 5. Visualization & Cleanup ---
-  show_results(argc, argv, timetable, entities, params);
+  //show_results(argc, argv, final_timetable, entities, params);
 
   for (auto &pair : entities)
     delete pair.second;
