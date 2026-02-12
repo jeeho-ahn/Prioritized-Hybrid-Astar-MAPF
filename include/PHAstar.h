@@ -682,15 +682,18 @@ public:
                         auto goal_pose = Pose(goal->x,goal->y,goal->yaw);
                         
                         // Call the visualizer immediately
-                        visualize_planning_debug(
-                            *timetable, 
-                            robot, 
-                            failed_res, 
-                            post_arrival_collision.time,
-                            current_pose,
-                            goal_pose, 
-                            params
-                        );
+                        if(DEBUG_VIS)
+                        {
+                            visualize_planning_debug(
+                                *timetable,
+                                robot,
+                                failed_res,
+                                post_arrival_collision.time,
+                                current_pose,
+                                goal_pose,
+                                params
+                            );
+                        }
                     }
                 }
                 else  // CollisionInfo (rs_info) not valid

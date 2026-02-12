@@ -344,6 +344,113 @@ void show_results(int argc, char** argv, const TimeTable& timetable, const std::
     app.exec();
 }
 
+/**
+ * Visualizes two timetables side-by-side for comparison.
+ */
+inline void show_comparison(int argc, char** argv,
+                     const TimeTable& tt_initial,
+                     const TimeTable& tt_best,
+                     const std::unordered_map<std::string, EntityMeta*>& entities,
+                     const Params& params) {
+    QApplication app(argc, argv);
+    QMainWindow win;
+    win.setWindowTitle("ALNS Comparison: Initial vs Best Solution");
+
+    QWidget* centralWidget = new QWidget;
+    QVBoxLayout* mainLayout = new QVBoxLayout(centralWidget);
+    win.setCentralWidget(centralWidget);
+
+    QHBoxLayout* vizLayout = new QHBoxLayout;
+    mainLayout->addLayout(vizLayout);
+
+    // Initial View
+    QVBoxLayout* initialLayout = new QVBoxLayout;
+    QLabel* initialLabel = new QLabel("<b>Initial Greedy Solution</b>");
+    initialLabel->setAlignment(Qt::AlignCenter);
+    VizWidget* vizInitial = new VizWidget(tt_initial, entities, params);
+    initialLayout->addWidget(initialLabel);
+    initialLayout->addWidget(vizInitial);
+    vizLayout->addLayout(initialLayout);
+
+    // Separator line
+    QFrame* line = new QFrame;
+    line->setFrameShape(QFrame::VLine);
+    line->setFrameShadow(QFrame::Sunken);
+    vizLayout->addWidget(line);
+
+    // Best View
+    QVBoxLayout* bestLayout = new QVBoxLayout;
+    double best_makespan = tt_best.get_max_time();
+    QLabel* bestLabel = new QLabel(QString("<b>Best ALNS Solution (Makespan: %1s)</b>").arg(best_makespan, 0, 'f', 2));
+    bestLabel->setAlignment(Qt::AlignCenter);
+    VizWidget* vizBest = new VizWidget(tt_best, entities, params);
+    bestLayout->addWidget(bestLabel);
+    bestLayout->addWidget(vizBest);
+    vizLayout->addLayout(bestLayout);
+
+    // Shared Controls
+    double max_t = std::max(tt_initial.get_max_time(), tt_best.get_max_time());
+    int max_val = static_cast<int>(max_t * 100 + 0.5);
+
+    QWidget* panel = new QWidget;
+    QHBoxLayout* ctrlLayout = new QHBoxLayout(panel);
+    mainLayout->addWidget(panel);
+
+    QSlider* slider = new QSlider(Qt::Horizontal);
+    slider->setRange(0, max_val);
+    slider->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+
+    QLabel* timeLabel = new QLabel("Time: 0.00 s");
+    timeLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+
+    QFontMetrics fm(timeLabel->font());
+    QString maxTimeStr = QString("Time: %1 s").arg(max_t, 0, 'f', 2);
+    timeLabel->setMinimumWidth(fm.horizontalAdvance(maxTimeStr) + 20);
+
+    QDoubleSpinBox* stepSpin = new QDoubleSpinBox();
+    stepSpin->setRange(0.01, qMax(0.01, max_t));
+    stepSpin->setSingleStep(0.05);
+    stepSpin->setValue(0.50);
+    stepSpin->setSuffix(" s");
+
+    QPushButton* prevBtn = new QPushButton("<<");
+    QPushButton* nextBtn = new QPushButton(">>");
+    prevBtn->setAutoRepeat(true);
+    nextBtn->setAutoRepeat(true);
+
+    ctrlLayout->addWidget(new QLabel("Step:"));
+    ctrlLayout->addWidget(stepSpin);
+    ctrlLayout->addWidget(prevBtn);
+    ctrlLayout->addWidget(slider);
+    ctrlLayout->addWidget(nextBtn);
+    ctrlLayout->addWidget(timeLabel);
+
+    // Coordination
+    auto updateTime = [=](double t) {
+        vizInitial->setTime(t);
+        vizBest->setTime(t);
+        timeLabel->setText(QString("Time: %1 s").arg(t, 0, 'f', 2));
+    };
+
+    QObject::connect(slider, &QSlider::valueChanged, [=](int val) {
+        updateTime(val / 100.0);
+    });
+
+    QObject::connect(prevBtn, &QPushButton::clicked, [=]() {
+        double new_t = qMax(0.0, (slider->value() / 100.0) - stepSpin->value());
+        slider->setValue(static_cast<int>(new_t * 100 + 0.5));
+    });
+
+    QObject::connect(nextBtn, &QPushButton::clicked, [=]() {
+        double new_t = qMin(max_t, (slider->value() / 100.0) + stepSpin->value());
+        slider->setValue(static_cast<int>(new_t * 100 + 0.5));
+    });
+
+    win.resize(1200, 700);
+    win.show();
+    app.exec();
+}
+
 void show_results(int argc, char** argv, const TimeTable& timetable, const std::unordered_map<std::string, EntityMeta*>& entities, const std::vector<Trajectory>& all_trajectories, const Params& params) {
     QApplication app(argc, argv);
     QMainWindow win;

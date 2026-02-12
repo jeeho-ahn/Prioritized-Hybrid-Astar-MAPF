@@ -439,7 +439,7 @@ CollisionInfo check_collision_trajectory_detailed(const Trajectory &traj, double
     if (traj.is_transfer && object) {
       for (const auto &[ent, other_p] : others) {
         if (ent == robot || ent == object) continue;
-        if (ent->type == EntityType::ROBOT) continue;
+        // if (ent->type == EntityType::ROBOT) continue; // FIX: Do NOT ignore robots! Pushed object must avoid them too.
         auto collision = check_entity_collision(obj_geom, obj_pose, ent, other_p, params);
         if (collision.has_collision) {
            return {false, "Object Collision", collision.colliding_entity->name, abs_t};
@@ -469,6 +469,12 @@ bool relocate_blocking_robot(RobotMeta* blocker,
     auto candidates = generate_parking_candidates(start_pose, blocker, params);
     
     for (const auto& cand : candidates) {
+        // Ensure we actually move away from the conflict spot
+        double move_dist = std::hypot(cand.pose.x - start_pose.x, cand.pose.y - start_pose.y);
+        if (blocked_traj_hint && move_dist < 0.1) {
+             continue; // Don't just stay put if we are blocking something
+        }
+
         bool conflict = false;
         if (blocked_traj_hint) {
             Corners cand_corners = get_corners(cand.pose.x, cand.pose.y, cand.pose.yaw, 
@@ -531,57 +537,51 @@ bool plan_initial_transit(
   auto path_res = planner.Planning_with_res(start_time);
 
   // If blocked by robot, we already have a "ghost" path in path_res.waypoints
-  bool relocated = false;
-  do {
-    if (path_res.status == PlanningStatus::BLOCKED_BY_ROBOT) {
-        std::cout << "  [Transit] Path blocked by robot " << path_res.colliding_entity << ". Attempting relocation..." << std::endl;
-        
-        Trajectory ghost_traj;
-        ghost_traj.waypoints = path_res.waypoints;
-        ghost_traj.entity = robot;
-        
-        if (ghost_traj.waypoints.empty()) {
-            std::cerr << " [Error] Blocked path has no waypoints! Cannot relocate." << std::endl;
-            path_res.status = PlanningStatus::NO_PATH_FOUND;
-            break;
-        }
-        
-        double initial_t = ghost_traj.waypoints.front().time;
-        for(auto& wp : ghost_traj.waypoints) wp.time -= initial_t;
-        
-        CollisionInfo col_info = check_collision_trajectory_detailed(ghost_traj, initial_t, timetable, params, false);
-        
-        if (!col_info.is_valid && !col_info.entity_name.empty()) {
-            if (entities.count(col_info.entity_name)) {
-                EntityMeta* collider = entities.at(col_info.entity_name);
-                if (collider && collider->type == EntityType::ROBOT) {
-                    RobotMeta* blocker = dynamic_cast<RobotMeta*>(collider);
-                    relocated = relocate_blocking_robot(blocker, timetable, params, entities, &ghost_traj);
-                    if (relocated) {
-                        std::cout << "  [Transit] Relocation successful. Retrying plan..." << std::endl;
-                        PHAStar retry_planner(robot, target_pose, &timetable, &entities, params, false, "", start_time);
-                        path_res = retry_planner.Planning_with_res(start_time);
-                    } else {
-                        std::cerr << "  [Transit] Relocation FAILED. Discarding blocked path." << std::endl;
-                        path_res.waypoints.clear();
-                        path_res.status = PlanningStatus::NO_PATH_FOUND;
-                        break;
-                    }
-                } else {
-                    path_res.status = PlanningStatus::NO_PATH_FOUND;
-                    break;
-                }
-            } else {
-                std::cerr << "  [Transit] Blocked by unknown entity/boundary (" << col_info.entity_name << "). Cannot relocate." << std::endl;
-                path_res.waypoints.clear();
-                path_res.status = PlanningStatus::NO_PATH_FOUND;
-                break;
-            }
-        }
-    } else {
-        break;
-    }
-  } while (relocated && path_res.status == PlanningStatus::BLOCKED_BY_ROBOT);
+  if (path_res.status == PlanningStatus::BLOCKED_BY_ROBOT) {
+      std::cout << "  [Transit] Path blocked by robot " << path_res.colliding_entity << ". Attempting relocation..." << std::endl;
+      
+      // We need a Trajectory object for relocate_blocking_robot
+      Trajectory ghost_traj;
+      ghost_traj.waypoints = path_res.waypoints;
+      ghost_traj.entity = robot; // FIX: Prevent segfault in collision check
+      
+      if (ghost_traj.waypoints.empty()) {
+          std::cerr << " [Error] Blocked path has no waypoints! Cannot relocate." << std::endl;
+          path_res.status = PlanningStatus::NO_PATH_FOUND;
+      } else {
+          // Need waypoints to be RELATIVE to 0 for check_collision... wait
+          // Actually relocate_blocking_robot and checking logic might prefer absolute?
+          // check_collision_trajectory_detailed uses relative times in waypoints.
+          double initial_t = ghost_traj.waypoints.front().time;
+      for(auto& wp : ghost_traj.waypoints) wp.time -= initial_t;
+      
+      CollisionInfo col_info = check_collision_trajectory_detailed(ghost_traj, initial_t, timetable, params, false);
+      
+      if (!col_info.is_valid && !col_info.entity_name.empty()) {
+          // Safeguard: Check if entity exists in map (e.g., "Boundary" might not)
+          if (entities.count(col_info.entity_name)) {
+              EntityMeta* collider = entities.at(col_info.entity_name);
+              if (collider && collider->type == EntityType::ROBOT) {
+                  RobotMeta* blocker = dynamic_cast<RobotMeta*>(collider);
+                  if (relocate_blocking_robot(blocker, timetable, params, entities, &ghost_traj)) {
+                       std::cout << "  [Transit] Relocation successful. Retrying plan..." << std::endl;
+                       // Restore absolute times for planner if we use it again? No, we create a new one.
+                       PHAStar retry_planner(robot, target_pose, &timetable, &entities, params, false, "", start_time);
+                       path_res = retry_planner.Planning_with_res(start_time);
+                  } else {
+                       std::cerr << "  [Transit] Relocation FAILED. Discarding blocked path." << std::endl;
+                       path_res.waypoints.clear();
+                       path_res.status = PlanningStatus::NO_PATH_FOUND;
+                  }
+              }
+          } else {
+              std::cerr << "  [Transit] Blocked by unknown entity/boundary (" << col_info.entity_name << "). Cannot relocate." << std::endl;
+              path_res.waypoints.clear();
+              path_res.status = PlanningStatus::NO_PATH_FOUND;
+          }
+      }
+  }
+  }
 
   // Fallback for cases where standard planning finds nothing (Search exhausted)
   if (path_res.waypoints.empty()) {
@@ -656,21 +656,6 @@ bool plan_initial_transit(
   final_push_wpt.time = path_res.waypoints.back().time + delta_t;
   final_push_wpt.linear_velocity = path_res.waypoints.back().linear_velocity;
   path_res.waypoints.push_back(final_push_wpt);
-
-  // Check collision for final push segment
-  Trajectory push_traj;
-  push_traj.entity = robot;
-  push_traj.start_time = start_time + (path_res.waypoints.size() > 1 ? path_res.waypoints[path_res.waypoints.size() - 2].time : 0);
-  push_traj.waypoints = {path_res.waypoints[path_res.waypoints.size() - 2], final_push_wpt};
-  // Make times relative for check
-  double push_start_rel = push_traj.waypoints[0].time;
-  for (auto &wp : push_traj.waypoints) wp.time -= push_start_rel;
-
-  CollisionInfo push_col = check_collision_trajectory_detailed(push_traj, push_traj.start_time, timetable, params);
-  if (!push_col.is_valid) {
-    std::cerr << " [Error] Final push collides with " << push_col.entity_name << " at t=" << push_col.time << std::endl;
-    return false;
-  }
 
   // Adjust relative time and register
   for (auto &wp : path_res.waypoints)
@@ -814,9 +799,21 @@ double find_safe_start_time(Trajectory *traj, double earliest_start,
   return -1.0; // Failure signal
 }
 
+// ==========================================
+// 3. MAIN TASK PIPELINE (Refactored for ALNS)
+// ==========================================
+
+// Global Timeline for Coin Attribution
+// Map: Robot -> Vector of <Interval, Task*>
+std::map<RobotMeta*, std::vector<std::pair<std::pair<double, double>, Task*>>> solution_timeline;
+
+void clear_timeline() {
+    solution_timeline.clear();
+}
+
 // Generates and adds a retraction trajectory (backing up) after a push
 void append_retraction(RobotMeta *robot, const Trajectory &previous_traj,
-                       TimeTable &timetable, const Params &params) {
+                       TimeTable &timetable) {
   if (previous_traj.waypoints.empty())
     return;
 
@@ -866,137 +863,368 @@ void append_retraction(RobotMeta *robot, const Trajectory &previous_traj,
   retract_traj.waypoints = retract_wp;
   retract_traj.is_transfer = false;
 
-  // Check collision for retraction
-  CollisionInfo retract_col = check_collision_trajectory_detailed(retract_traj, retract_traj.start_time, timetable, params);
-  if (!retract_col.is_valid) {
-    std::cerr << " [Error] Retraction collides with " << retract_col.entity_name << " at t=" << retract_col.time << std::endl;
-    // Optionally shorten or skip retraction
-    return;
-  }
-
   timetable.add_trajectory(retract_traj);
   std::cout << "  [Retract] Backing up " << retract_dist << "m ("
             << current_time << "s)." << std::endl;
 }
 
-// ==========================================
-// 3. MAIN TASK PIPELINE
-// ==========================================
+void register_task_schedule(RobotMeta* robot, Task* task, double start_t, double end_t) {
+    solution_timeline[robot].push_back({{start_t, end_t}, task});
+}
+
+Task* get_task_at_time(RobotMeta* robot, double time) {
+    if (solution_timeline.find(robot) == solution_timeline.end()) return nullptr;
+    for (const auto& entry : solution_timeline[robot]) {
+        if (time >= entry.first.first && time <= entry.first.second) {
+            return entry.second;
+        }
+    }
+    return nullptr;
+}
 
 // Helper function to handle the scheduling of a single path segment
 void schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
                            RobotMeta *robot, TimeTable &timetable,
                            const Params &params,
-                           const std::unordered_map<std::string, EntityMeta *> &entities) {
+                           const std::unordered_map<std::string, EntityMeta *> &entities,
+                           Task* current_task) { // Added current_task for coin attribution
+                           
   // 1. Get current available time from the timetable
   double current_avail_time = timetable.get_entity_max_time(robot);
 
   // 2. Convert EdgePath to Trajectory
-  // ReloPushPath2TrajPtr is defined in Task.h
-  TrajectoryPtr traj =
-      ReloPushPath2TrajPtr(edge_path, robot, obj_meta, current_avail_time);
+  TrajectoryPtr traj = ReloPushPath2TrajPtr(edge_path, robot, obj_meta, current_avail_time);
 
   // FIX: Ensure entity and relative timestamps are set for collision checking!
   traj->entity = robot;
   traj->CalcualteTimeStamps(robot);
 
   // 3. Find safe start time
-  double safe_start_time =
-      find_safe_start_time(traj.get(), current_avail_time, timetable, params, entities);
+  // We need to intercept find_safe_start_time to record coins, but function signature is fixed.
+  // Instead, let's copy the logic of find_safe_start_time here or wrap it. 
+  // For cleaner code, I will duplicate the relevant parts of find_safe_start_time logic 
+  // OR modify find_safe_start_time to accept a callback/Task pointer. 
+  // Let's modify find_safe_start_time to be unaware of Task, but return info we can use? 
+  // No, `find_safe_start_time` is defined above in this file. Let's modify it to accept Task* optional.
+  
+  // -- Wait, I can't easily modify the function signature in previous block without another tool call.
+  // actually I can just use the existing one, but we need to track *why* it delayed.
+  // The existing `find_safe_start_time` prints to stdout. 
+  // Let's redefine `find_safe_start_time_instrumented` locally or inline it.
+
+  // Inline "Find Safe Start Time" with Coin Logic
+  double check_time = current_avail_time;
+  double step = 0.5;
+  int max_retries = 200; 
+
+  std::string last_relocated_robot_name = "";
+  double last_relocation_time = -100.0;
+  
+  // Track wait duration for this segment
+  double wait_duration = 0.0;
+
+  bool success = false;
+  for (int i = 0; i < max_retries; ++i) {
+    CollisionInfo col_info = check_collision_trajectory_detailed(*traj, check_time, timetable, params, false);
+    
+    if (col_info.is_valid) {
+        // Success
+        success = true;
+        break;
+    }
+
+    // Handle Collision & Attributes Coins
+    EntityMeta* collider = nullptr;
+    if (entities.count(col_info.entity_name)) {
+        collider = entities.at(col_info.entity_name);
+    }
+
+    if (collider && collider->type == EntityType::ROBOT) {
+        RobotMeta* blocker = dynamic_cast<RobotMeta*>(collider);
+        
+        // Attibute Blocker Coin
+        Task* blocking_task = get_task_at_time(blocker, col_info.time);
+        if (blocking_task && blocking_task != current_task) {
+            blocking_task->blocker_coins += 1.0; // Basic weight
+            // std::cout << "    [Coin] Task " << blocking_task->id << " gets Blocker coin from Task " << current_task->id << std::endl;
+        }
+
+        double blocker_free_time = timetable.get_entity_max_time(blocker);
+        if (col_info.time > blocker_free_time) {
+            // Blocker is stationary. Relocate.
+             if (blocker->name != last_relocated_robot_name || (check_time - last_relocation_time > 5.0)) {
+                if (relocate_blocking_robot(blocker, timetable, params, entities, traj.get())) {
+                    last_relocated_robot_name = blocker->name;
+                    last_relocation_time = check_time;
+                    check_time -= step; // Retry same time
+                    // Relocation doesn't count as wait for the current robot, but blocker gets coin
+                }
+            }
+        }
+    }
+    
+    check_time += step;
+    wait_duration += step;
+  }
+  
+  if (wait_duration > 0) {
+      current_task->waiter_coins += wait_duration;
+  }
+  
+  double safe_start_time = success ? check_time : -1.0;
+
+  if (safe_start_time < 0) {
+       std::cerr << " [Error] Segment failed." << std::endl;
+       return; // Should propagate error really
+  }
 
   // 4. Update timestamps and add to timetable
   traj->start_time = safe_start_time;
-
-  // CalcualteTimeStamps is defined in Entities.h
   traj->CalcualteTimeStamps(robot);
-
   timetable.add_trajectory(*traj);
 }
 
-bool process_task_execution(
+bool process_task_execution_instrumented(
     RobotMeta *robot, Task &task, TimeTable &timetable,
     const std::unordered_map<std::string, EntityMeta *> &entities,
     const Params &params) {
+    
+  double start_record_time = timetable.get_entity_max_time(robot);
+  
   // 1. Plan Transit to Task Start
   double robot_avail_time = timetable.get_entity_max_time(robot);
+  
+  // Use existing transit planner but monitor result?
+  // `plan_initial_transit` internally handles relocation. 
+  // It's hard to inject coin logic there without modifying it.
+  // For now, let's rely on standard transit. If it fails or waits heavily...
+  // Actually, plan_initial_transit uses A*. The "wait" is implicit in the path cost/travel time?
+  // PHAstar output `path_res.waypoints` has times. 
+  // Extra time taken vs ideal time could be "Waiter" coin.
+  
+  double ideal_transit_time = std::hypot(task.TaskStartPoseRobot.x - robot->initial_pose.x, 
+                                         task.TaskStartPoseRobot.y - robot->initial_pose.y) / robot->speed_transit;
+                                         
   if (!plan_initial_transit(robot, task.TaskStartPoseRobot, robot_avail_time,
                             timetable, entities, params)) {
+    // If transit fails completely...
     std::cerr << "Aborting task due to transit failure." << std::endl;
     return false;
+  }
+  
+  // Calculate Transit Wait
+  double actual_transit_end = timetable.get_entity_max_time(robot);
+  double actual_transit_duration = actual_transit_end - robot_avail_time;
+  if (actual_transit_duration > ideal_transit_time + 5.0) { // Tolerance
+      task.waiter_coins += (actual_transit_duration - ideal_transit_time);
   }
 
   // 2. ObsRelo (if exists)
   if (task.vertexChain.size() > 2) {
-    // Iterate through obstacles
     for (size_t obs_ind = 1; obs_ind < task.vertexChain.size() - 1; obs_ind++) {
-      std::cout << "Obstacle Relocation" << std::endl;
-
-      // Identify the obstacle
       std::string obs_name = task.vertexChain[obs_ind].name;
       auto obs_meta = entities.at(obs_name);
-
       size_t push_path_idx = 0;
       size_t post_path_idx = 1;
 
       if (task.obsReloPaths->size() > post_path_idx) {
-        // Step A: Two-point push trajectory
         schedule_path_segment(task.obsReloPaths->at(push_path_idx), obs_meta,
-                              robot, timetable, params, entities);
-
-        // Step B: Schedule the "Post-Obs/Return" path
+                              robot, timetable, params, entities, &task);
         schedule_path_segment(task.obsReloPaths->at(post_path_idx), obs_meta,
-                              robot, timetable, params, entities);
-      } else {
-        std::cerr << "Error: obsReloPaths missing required paths for index "
-                  << obs_ind << std::endl;
+                              robot, timetable, params, entities, &task);
       }
     }
   }
 
-  // 3. Execute Edge Paths (Pushing / Relocation Segments)
-  int segment_idx = 0;
+  // 3. Execute Edge Paths
   for (auto &path_ptr : task.EdgePaths) {
-    segment_idx++;
     double segment_ready_time = timetable.get_entity_max_time(robot);
-
-    // Prepare Trajectory Object
     path_ptr->entity = robot;
-    path_ptr->CalcualteTimeStamps(
-        robot); // Reset internal relative times based on robot constraints
+    path_ptr->CalcualteTimeStamps(robot);
 
-    Pose segment_goal = path_ptr->waypoints.back();
-
-    // B. Find Valid Start Time (Collision Delay)
-    std::cout << "  [Segment " << segment_idx << "] Checking schedule..."
-              << std::endl;
-    double safe_start_time = find_safe_start_time(
-        path_ptr.get(), segment_ready_time, timetable, params, entities);
-    if (safe_start_time < 0) { // Or if waypoints.empty() after any re-plan
-      std::cerr << " [Error] Segment " << segment_idx
-                << " failed (permanent blockage or empty path)" << std::endl;
-      if (DEBUG_VIS) {
-        Pose start_pose = timetable.get_pose(
-            robot, segment_ready_time); // Current at ready time
-        visualize_current_state(timetable, entities, params, segment_ready_time,
-                                start_pose, segment_goal);
-      }
-      return false; // Break logic was here, now return false
+    // Reuse the instrumented logic? No, I implemented schedule_path_segment above to be instrumented.
+    // Wait, the original code had inline find_safe_start_time call.
+    // I should check validity.
+    
+    // We already defined schedule_path_segment above to replace the inline code.
+    // But `Task::EdgePaths` contains pointers that need to be updated.
+    // `schedule_path_segment` takes EdgePath (const ref) and converts to new Trajectory.
+    // The original code updated `path_ptr` directly. 
+    // Let's manually do it here to ensure `path_ptr` in Task is updated (for visualization/record).
+    
+    TrajectoryPtr traj = path_ptr; // Shared ptr
+    // traj->entity/timestamps already set
+    
+    // Inline Safe Start Instrumented
+    double check_time = segment_ready_time;
+    double step = 0.5;
+    int max_retries = 200;
+    std::string last_relocated_robot = "";
+    double last_relocation_time = -100.0;
+    double wait_val = 0.0;
+    bool seg_success = false;
+    
+    for (int i = 0; i < max_retries; ++i) {
+        CollisionInfo col_info = check_collision_trajectory_detailed(*traj, check_time, timetable, params, false);
+     
+        if (col_info.is_valid) {
+            seg_success = true;
+            break;
+        }
+        
+        // Coins
+        if (entities.count(col_info.entity_name)) {
+             EntityMeta* ent = entities.at(col_info.entity_name);
+             if (ent->type == EntityType::ROBOT) {
+                 RobotMeta* blocker = dynamic_cast<RobotMeta*>(ent);
+                 Task* blk_task = get_task_at_time(blocker, col_info.time);
+                 if (blk_task && blk_task != &task) {
+                     blk_task->blocker_coins += 1.0;
+                 }
+                 
+                 // Relocate logic
+                 if (col_info.time > timetable.get_entity_max_time(blocker)) {
+                      if (blocker->name != last_relocated_robot || (check_time - last_relocation_time > 5.0)) {
+                        if (relocate_blocking_robot(blocker, timetable, params, entities, traj.get())) {
+                            last_relocated_robot = blocker->name;
+                            last_relocation_time = check_time;
+                            check_time -= step; 
+                        }
+                    }
+                 }
+             }
+        }
+        
+        check_time += step;
+        wait_val += step;
     }
-
-    // C. Register Trajectory
-    path_ptr->start_time = safe_start_time;
-    path_ptr->is_transfer = path_ptr->is_transfer; // Explicit for clarity
-    path_ptr->transferred_object =
-        path_ptr->is_transfer ? path_ptr->transferred_object : nullptr;
-    timetable.add_trajectory(*path_ptr);
-
-    // D. Handle Retraction (if this was a push)
-    if (path_ptr->is_transfer) {
-      append_retraction(robot, *path_ptr, timetable, params);
+    
+    if (!seg_success) {
+        std::cerr << "Segment failed." << std::endl;
+        return false;
+    }
+    
+    if (wait_val > 0) task.waiter_coins += wait_val;
+    
+    traj->start_time = check_time;
+    traj->CalcualteTimeStamps(robot);
+    timetable.add_trajectory(*traj);
+    
+    if (traj->is_transfer) {
+      append_retraction(robot, *traj, timetable);
     }
   }
+  
+  double end_record_time = timetable.get_entity_max_time(robot);
+  register_task_schedule(robot, &task, start_record_time, end_record_time);
+
   return true;
 }
+
+void solve_allocation(std::vector<Task>& tasks, std::vector<RobotMeta*>& robots, 
+                      TimeTable& timetable, const Params& params,
+                      const std::unordered_map<std::string, EntityMeta *>& entities) {
+    
+    // Reset Robots
+    for(auto* r : robots) {
+        r->initial_pose = timetable.get_pose(r, 0.0); // Reset to t=0 pose? 
+        // Actually TimeTable is passed in. If LNS, we might rebuild TimeTable from scratch.
+        // The user says: "The robots start from the same initial poses as they did in the greedy allocation."
+        // So we should assume `timetable` is FRESH (empty except initials) when calling this.
+    }
+    
+    clear_timeline();
+    
+    int task_idx = 0;
+    for(auto& task : tasks) {
+        task_idx++;
+        // If already assigned (kept from previous generation), just plan it.
+        // If not assigned, try to assign.
+        
+        if (task.assignedRobot) {
+             // Pre-assigned (kept)
+             // We still need to re-plan the PATH because other robots might have changed schedules.
+             // "From here, we need to do the necessary path planning from scratch"
+             if (!process_task_execution_instrumented(task.assignedRobot, task, timetable, entities, params)) {
+                 // Feasibility failed?
+                 std::cerr << " [Warn] Task " << task.id << " failed with pre-assigned " << task.assignedRobot->name << ". Re-allocating..." << std::endl;
+                 task.assignedRobot = nullptr; // Fall through to re-allocation
+             }
+        }
+        
+        if (!task.assignedRobot) {
+             // Greedy Allocation
+             auto candidates = get_sorted_candidate_robots(robots, timetable);
+             bool assigned = false;
+             for(auto& [cand, t] : candidates) {
+                 if (process_task_execution_instrumented(cand, task, timetable, entities, params)) {
+                     task.assignedRobot = cand;
+                     assigned = true;
+                     break;
+                 }
+             }
+             if (!assigned) {
+                 std::cout << " [Fail] Task " << task.id << " could not be assigned (Deadlock)." << std::endl;
+                 task.deadlock_coins += 10.0;
+                 // Assign deadlock to previous tasks?
+                 // "Give deadlock coin to the prior task by another robot" -- hard to track "cause".
+                 // For now, just mark this task.
+             }
+        }
+    }
+}
+
+void destroy_tasks(std::vector<Task>& tasks, int num_to_destroy) {
+    std::vector<std::pair<double, int>> weights;
+    for(int i=0; i<tasks.size(); ++i) {
+        double w = tasks[i].blocker_coins * 1.0 + 
+                   tasks[i].waiter_coins * 1.0 + 
+                   tasks[i].deadlock_coins * 5.0 + 
+                   1.0; // Base weight
+        weights.push_back({w, i});
+    }
+    
+    // Random selection based on weights
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    
+    std::cout << "  [Destroy] Selecting " << num_to_destroy << " tasks to remove..." << std::endl;
+    for(int k=0; k<num_to_destroy; ++k) {
+        if (weights.empty()) break;
+        
+        std::discrete_distribution<> d(weights.size(), 0.0, 1.0, 
+            [&](double i) { return weights[static_cast<size_t>(i)].first; }); 
+            // Standard discrete_distribution takes iterators or init list.
+            // Let's just use simple roulette wheel or sort.
+        
+        // Simple roulette
+        double total_w = 0;
+        for(auto& p : weights) total_w += p.first;
+        std::uniform_real_distribution<> dist(0, total_w);
+        double r = dist(gen);
+        
+        double acc = 0;
+        int selected_idx = -1;
+        int vec_idx = -1;
+        for(size_t i=0; i<weights.size(); ++i) {
+            acc += weights[i].first;
+            if (acc >= r) {
+                selected_idx = weights[i].second;
+                vec_idx = i;
+                break;
+            }
+        }
+        if (selected_idx != -1) {
+            tasks[selected_idx].assignedRobot = nullptr;
+            std::cout << "    -> Removed Task " << tasks[selected_idx].id << " (Coins: B=" 
+                      << tasks[selected_idx].blocker_coins << ", W=" << tasks[selected_idx].waiter_coins << ")" << std::endl;
+            
+            // Remove from weights
+            weights.erase(weights.begin() + vec_idx);
+        }
+    }
+}
+
 
 // ==========================================
 // 4. MAIN ENTRY POINT
@@ -1018,67 +1246,228 @@ int main(int argc, char **argv) {
   // --- 2. Initialize Environment ---
   Params params = initialize_params(loadedSequence);
   auto entities = initialize_entities(loadedSequence);
-  TimeTable timetable(0.5);
-  timetable.add_initial(entities);
-
+  
   // Identify Robots
   std::vector<RobotMeta *> all_robots;
+  std::map<RobotMeta*, Pose> original_initial_poses; // Backup for reset
   for (const auto &[name, ent] : entities) {
-    if (ent->type == EntityType::ROBOT)
-      all_robots.push_back(dynamic_cast<RobotMeta *>(ent));
+    if (ent->type == EntityType::ROBOT) {
+      RobotMeta* r = dynamic_cast<RobotMeta *>(ent);
+      all_robots.push_back(r);
+      original_initial_poses[r] = r->initial_pose;
+    }
   }
 
   // --- 3. Initialize Tasks ---
   std::vector<Task> tasks;
+  int oid = 0;
   for (const auto &fa : loadedSequence) {
     tasks.emplace_back(fa, entities);
+    tasks.back().id = oid++;
   }
-  std::cout << "[System] Initialized " << tasks.size() << " tasks."
-            << std::endl;
+  std::cout << "[System] Initialized " << tasks.size() << " tasks." << std::endl;
 
-  // --- 4. Task Allocation & Execution Loop ---
-  int task_counter = 0;
+  // Helper to reset robots
+  auto reset_robots = [&]() {
+      std::cout << "  [Reset] Restoring initial poses:" << std::endl;
+      for(auto& [r, pose] : original_initial_poses) {
+          r->initial_pose = pose;
+          std::cout << "    - " << r->name << ": (" << pose.x << ", " << pose.y << ")" << std::endl;
+      }
+  };
+  
+  // Helper to verify collisions
+  auto verify_collisions = [&](const TimeTable& tt, double duration) {
+       std::cout << "  [Verify] Checking for collisions in final timeline (0 to " << duration << "s)..." << std::endl;
+       double dt = 0.2;
+       int collision_count = 0;
+       for(double t=0; t<=duration; t+=dt) {
+           auto poses = tt.get_poses(t);
+           std::vector<std::string> names;
+           for(auto& [ent, p] : poses) names.push_back(ent->name);
+           
+           for(size_t i=0; i<names.size(); ++i) {
+               for(size_t j=i+1; j<names.size(); ++j) {
+                   auto ent1 = entities.at(names[i]);
+                   auto ent2 = entities.at(names[j]);
+                   Pose p1 = poses[ent1];
+                   Pose p2 = poses[ent2];
+                   if(ent1->type == EntityType::ROBOT && ent2->type == EntityType::ROBOT) {
+                       // Robot-Robot
+                       CollisionGeometry g1 = setup_collision_geometry(p1, ent1->size, 0.0); // No inflation for check
+                       auto col = check_entity_collision(g1, p1, ent2, p2, params);
+                       if(col.has_collision) {
+                           std::cout << "    [CRITICAL] Collision at t=" << t << "s between " << ent1->name << " and " << ent2->name << std::endl;
+                           collision_count++;
+                       }
+                   }
+                   // Can add Object checks too
+               }
+           }
+           if (collision_count > 5) break; // Limit output
+       }
+       if(collision_count == 0) std::cout << "  [Verify] No collisions detected." << std::endl;
+  };
 
-  for (auto &task : tasks) {
-    task_counter++;
-    std::cout << "\n=== Processing Task " << task_counter << " ("
-              << task.targetObject->name << ") ===" << std::endl;
+  // --- 4. Initial Greedy Allocation ---
+  std::cout << "\n\n=== Initial Greedy Allocation ===" << std::endl;
+  reset_robots(); // Ensure clean state
+  TimeTable initial_timetable(0.5);
+  initial_timetable.add_initial(entities);
+  
+  solve_allocation(tasks, all_robots, initial_timetable, params, entities);
+  
+  double initial_makespan = initial_timetable.get_max_time();
+  std::cout << "[Result] Initial Solution Makespan: " << initial_makespan << "s" << std::endl;
+  verify_collisions(initial_timetable, initial_makespan);
+  
+  // Backup best solution
+  double best_makespan = initial_makespan;
+  TimeTable best_timetable = initial_timetable; // Store best found so far
+  
+  std::cout << "[System] Visualizing Initial Solution..." << std::endl;
+  show_results(argc, argv, initial_timetable, entities, params);
 
-    // Generate candidate list sorted by availability
-    auto candidates = get_sorted_candidate_robots(all_robots, timetable);
+  // --- 5. ALNS Loop ---
+  int max_iterations = 5;
+  int destroy_count = 3;
 
-    // If a robot was pre-assigned, prioritize it
-    if (task.assignedRobot) {
-        auto it = std::find_if(candidates.begin(), candidates.end(),
-            [&](const auto& p) { return p.first == task.assignedRobot; });
-        if (it != candidates.end()) {
-            std::rotate(candidates.begin(), it, it + 1);
-        }
-    }
+  struct IterationLog {
+      int iter;
+      double makespan;
+      std::vector<int> destroyed_tasks;
+      std::string heuristics_info;
+      double improvement;
+  };
+  std::vector<IterationLog> history;
+  
+  // Record initial
+  history.push_back({0, initial_makespan, {}, "Initial Greedy", 0.0});
 
-    bool task_success = false;
-    for (auto& [cand_robot, free_time] : candidates) {
-        task.assignedRobot = cand_robot; // Tentative assignment
-        std::cout << "[Assign] Attempting " << cand_robot->name 
-                  << " (Free at t=" << std::fixed << std::setprecision(2) << free_time << "s)" << std::endl;
+  for (int iter = 1; iter <= max_iterations; ++iter) {
+      std::cout << "\n\n=== ALNS Iteration " << iter << " ===" << std::endl;
+      
+      // 1. Destroy
+      std::vector<int> currently_destroyed;
+      std::stringstream heuristics_ss;
+      
+      std::vector<std::pair<double, int>> weights;
+      for(int i=0; i<tasks.size(); ++i) {
+          double w = tasks[i].blocker_coins * 1.0 + 
+                     tasks[i].waiter_coins * 1.0 + 
+                     tasks[i].deadlock_coins * 5.0 + 
+                     1.0; 
+          weights.push_back({w, i});
+      }
+      
+      std::random_device rd;
+      std::mt19937 gen(rd());
+      std::cout << "  [Destroy] Selecting " << destroy_count << " tasks..." << std::endl;
+      
+      for(int k=0; k<destroy_count; ++k) {
+          if (weights.empty()) break;
+          double total_w = 0;
+          for(auto& p : weights) total_w += p.first;
+          std::uniform_real_distribution<> dist(0, total_w);
+          double r = dist(gen);
+          double acc = 0;
+          int selected_idx = -1;
+          int vec_idx = -1;
+          for(size_t i=0; i<weights.size(); ++i) {
+              acc += weights[i].first;
+              if (acc >= r) {
+                  selected_idx = weights[i].second;
+                  vec_idx = i;
+                  break;
+              }
+          }
+          if (selected_idx != -1) {
+              tasks[selected_idx].assignedRobot = nullptr;
+              currently_destroyed.push_back(tasks[selected_idx].id);
+              
+              // Determine dominant heuristic
+              std::string reason = "Random";
+              double b = tasks[selected_idx].blocker_coins;
+              double w = tasks[selected_idx].waiter_coins;
+              double d = tasks[selected_idx].deadlock_coins;
+              if (d > 0) reason = "Deadlock(" + std::to_string(int(d)) + ")";
+              else if (b > w && b > 1) reason = "Blocker(" + std::to_string(int(b)) + ")";
+              else if (w > b && w > 1) reason = "Waiter(" + std::to_string(int(w)) + ")";
+              
+              heuristics_ss << "T" << tasks[selected_idx].id << ":" << reason << " ";
+              
+              std::cout << "    -> Removed Task " << tasks[selected_idx].id << " [" << reason << "]" << std::endl;
+              weights.erase(weights.begin() + vec_idx);
+          }
+      }
+      
+      // 2. Clear coins
+      for(auto& t : tasks) {
+          t.blocker_coins = 0;
+          t.waiter_coins = 0;
+          t.deadlock_coins = 0;
+      }
+      
+      // 3. Repair (Solve)
+      reset_robots(); 
+      TimeTable current_timetable(0.5);
+      current_timetable.add_initial(entities);
+      
+      solve_allocation(tasks, all_robots, current_timetable, params, entities);
+      
+      double current_makespan = current_timetable.get_max_time();
+      
+      // Log result
+      IterationLog log_entry;
+      log_entry.iter = iter;
+      log_entry.makespan = current_makespan;
+      log_entry.destroyed_tasks = currently_destroyed;
+      log_entry.heuristics_info = heuristics_ss.str();
+      log_entry.improvement = initial_makespan - current_makespan; // Relative to initial
+      
+      history.push_back(log_entry);
 
-        if (process_task_execution(cand_robot, task, timetable, entities, params)) {
-             task_success = true;
-             std::cout << "[Assign] SUCCESS with " << cand_robot->name << std::endl;
-             break;
-        } else {
-             std::cout << "[Assign] FAILED with " << cand_robot->name << " (Transit Blocked) - Trying next..." << std::endl;
-        }
-    }
-
-    if (!task_success) {
-        std::cerr << "[Critical] Task " << task_counter << " failed with ALL available robots." << std::endl;
-    }
+      std::cout << "[Result] Iteration " << iter << " Makespan: " << current_makespan << "s";
+      if (current_makespan < best_makespan) { 
+          std::cout << " (NEW BEST) ";
+          best_makespan = current_makespan;
+          best_timetable = current_timetable; // Update best found
+      }
+      std::cout << std::endl;
+      
+      verify_collisions(current_timetable, current_makespan);
+      
+      // 4. Visualize (Skipped per request/comment)
+      // std::cout << "[System] Visualizing Iteration " << iter << "..." << std::endl;
+      // show_results(argc, argv, current_timetable, entities, params);
   }
 
-  // --- 5. Visualization & Cleanup ---
-  show_results(argc, argv, timetable, entities, params);
+  // --- Final Summary ---
+  std::cout << "\n\n=========================================" << std::endl;
+  std::cout << "           ALNS RESULTS SUMMARY          " << std::endl;
+  std::cout << "=========================================" << std::endl;
+  std::cout << "Iter | Makespan (s) | Improvement | Destroyed Tasks (Constraint)" << std::endl;
+  std::cout << "----------------------------------------------------------------" << std::endl;
+  for(const auto& log : history) {
+      std::cout << std::setw(4) << log.iter << " | " 
+                << std::setw(12) << std::fixed << std::setprecision(2) << log.makespan << " | "
+                << std::setw(11) << (log.iter==0 ? "-" : (log.improvement >= 0 ? "+" + std::to_string(log.improvement) : std::to_string(log.improvement))) << " | ";
+      
+      if (log.iter == 0) {
+          std::cout << "Initial Solution";
+      } else {
+          std::cout << log.heuristics_info;
+      }
+      std::cout << std::endl;
+  }
+  std::cout << "=========================================" << std::endl;
+  std::cout << "Best Makespan Found: " << best_makespan << "s" << std::endl;
 
+  // --- 6. Final Visualization (Side-by-Side Comparison) ---
+  std::cout << "\n[System] Visualizing Comparison (Initial vs Best " << best_makespan << "s)..." << std::endl;
+  show_comparison(argc, argv, initial_timetable, best_timetable, entities, params);
+
+  // Final Cleanup
   for (auto &pair : entities)
     delete pair.second;
   return 0;

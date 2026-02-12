@@ -77,6 +77,12 @@ public:
     std::pair<Task*, DependType> transitDepend;
     RobotMeta* assignedRobot = nullptr;
     ObjectMeta* targetObject = nullptr;
+    
+    // ALNS Coins
+    double blocker_coins = 0.0;
+    double waiter_coins = 0.0;
+    double deadlock_coins = 0.0;
+    int id = -1;
 
     ////// added to handle obsRelo (need to verify)
     ReloPush::StatePathPtr firstApproachPath;
