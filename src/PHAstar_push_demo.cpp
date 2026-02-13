@@ -21,6 +21,9 @@
 #include <cmath>
 #include <limits>
 #include <random>
+#include <queue>
+#include <unordered_set>
+#include <memory>
 
 
 const bool DEBUG_VIS = false;
@@ -338,37 +341,94 @@ generate_parking_candidates(const Pose &current_pose, RobotMeta *robot,
   double init_L = compute_rs_length(robot->initial_pose);
   candidates.push_back({robot->initial_pose, init_L});
 
-  // 2. Workspace corners with multiple orientations (out-of-the-way locations)
+  // 2. Motion Primitive Sampling (Minimize Displacement)
+  // Directions: Forward (+1), Backward (-1)
+  // Steers: 0 (Straight), +Max (Left), -Max (Right)
+  // Distances: Small discrete steps
+  
+  std::vector<int> prim_dirs = {1, -1};
+  std::vector<double> prim_steers = {0.0, maxc * wb, -maxc * wb}; // maxc = 1/Rmin, max_steer ~ atan(wb * maxc) -> actually we use curvature control in ReedsShepp, but here let's approximate
+  // Actually max_steer is atan(wheel_base * max_curvature). 
+  // Let's rely on geometric update directly using Curvature (k = tan(delta)/L).
+  std::vector<double> prim_ks = {0.0, maxc, -maxc};
+  
+  std::vector<double> prim_dists = {0.5, 1.0, 1.5, 2.0, 3.0}; 
+
+  for (double dist : prim_dists) {
+      for (int dir : prim_dirs) {
+          for (double k : prim_ks) {
+                double d = dir * dist;
+                double x_new, y_new, yaw_new;
+                
+                if (std::abs(k) < 1e-5) {
+                    // Straight
+                    x_new = current_pose.x + d * std::cos(current_pose.yaw);
+                    y_new = current_pose.y + d * std::sin(current_pose.yaw);
+                    yaw_new = current_pose.yaw;
+                } else {
+                    // Arc
+                    // R = 1/k. d = R * beta -> beta = d * k
+                    double R = 1.0 / k;
+                    double beta = d / R; // d and R have same sign logic? ReedsShepp uses d > 0 usually?
+                    // Let's stick to standard formula:
+                    // theta' = theta + beta
+                    // x' = x + R(sin(theta + beta) - sin(theta))
+                    // y' = y - R(cos(theta + beta) - cos(theta)) -- Standard math usually: y' = y + R(cos(theta) - cos(theta+beta))? 
+                    // Let's use the one from PHAstar::generate_node
+                    // x += R * (std::sin(yaw + beta) - std::sin(yaw));
+                    // y += R * (std::cos(yaw) - std::cos(yaw + beta));
+                    // yaw += beta;
+                    
+                    x_new = current_pose.x + R * (std::sin(current_pose.yaw + beta) - std::sin(current_pose.yaw));
+                    y_new = current_pose.y + R * (std::cos(current_pose.yaw) - std::cos(current_pose.yaw + beta));
+                    yaw_new = current_pose.yaw + beta;
+                }
+                
+                // Wrap Yaw
+                while(yaw_new > M_PI) yaw_new -= 2*M_PI;
+                while(yaw_new < -M_PI) yaw_new += 2*M_PI;
+                
+                // Create Candidate
+                Pose p{x_new, y_new, yaw_new};
+                
+                // Bounds Check immediately to prune useful candidates
+                if (p.x >= params.min_x + 0.2 && p.x <= params.max_x - 0.2 &&
+                    p.y >= params.min_y + 0.2 && p.y <= params.max_y - 0.2) {
+                     candidates.push_back({p, dist}); // Cost is just the move distance (cheaper than driving to corner)
+                }
+          }
+      }
+  }
+
+  // 3. Workspace corners with multiple orientations (out-of-the-way locations)
   double margin = 0.6; // Safe margin from exact bounds
   std::vector<double> corner_yaws = {0.0, M_PI / 2, M_PI, -M_PI / 2};
-  std::vector<std::pair<double, double>> corner_positions = {
-      {params.min_x + margin, params.min_y + margin},
-      {params.max_x - margin, params.min_y + margin},
-      {params.max_x - margin, params.max_y - margin},
-      {params.min_x + margin, params.max_y - margin}};
-
-  for (const auto &pos : corner_positions) {
-    for (double yaw : corner_yaws) {
-      Pose p{pos.first, pos.second, yaw};
-      double L = compute_rs_length(p);
-      candidates.push_back({p, L});
-    }
+  
+  // Dense Boundary Sampling
+  double boundary_step = 1.0; 
+  for (double x = params.min_x + margin; x <= params.max_x - margin; x += boundary_step) {
+       for (double yaw : corner_yaws) {
+            candidates.push_back({{x, params.min_y + margin, yaw}, 0.0});
+            candidates.push_back({{x, params.max_y - margin, yaw}, 0.0});
+       }
+  }
+  for (double y = params.min_y + margin; y <= params.max_y - margin; y += boundary_step) {
+       for (double yaw : corner_yaws) {
+            candidates.push_back({{params.min_x + margin, y, yaw}, 0.0});
+            candidates.push_back({{params.max_x - margin, y, yaw}, 0.0});
+       }
   }
 
-  // 3. Random samples as fallback (20-30 is plenty)
-  std::random_device rd;
-  std::mt19937 gen(rd());
-  std::uniform_real_distribution<> x_dist(params.min_x + margin,
-                                          params.max_x - margin);
-  std::uniform_real_distribution<> y_dist(params.min_y + margin,
-                                          params.max_y - margin);
-  std::uniform_real_distribution<> yaw_dist(-M_PI, M_PI);
-
-  for (int i = 0; i < 25; ++i) {
-    Pose p{x_dist(gen), y_dist(gen), yaw_dist(gen)};
-    double L = compute_rs_length(p);
-    candidates.push_back({p, L});
+  // Calculate costs after generating all
+  for(auto& cand : candidates) {
+       if (cand.estimated_rs_length == 0.0 && (cand.pose.x != robot->initial_pose.x)) { // Don't recalc initial
+           cand.estimated_rs_length = compute_rs_length(cand.pose);
+       }
   }
+
+  
+  // Random samples removed for determinism
+  // Fixed candidates only (initial + corners)
 
   // Sort by Reeds-Shepp length (lower is better). INF goes to the end.
   std::sort(candidates.begin(), candidates.end(),
@@ -457,62 +517,194 @@ bool relocate_blocking_robot(RobotMeta* blocker,
                              const Trajectory* blocked_traj_hint = nullptr) {
     
     double ready_time = timetable.get_entity_max_time(blocker);
-    // Add small buffer to start time to ensure no conflict with previous finish
+    // Add small buffer
     ready_time += 0.1; 
     
     Pose start_pose = timetable.get_pose(blocker, ready_time);
-    blocker->initial_pose = start_pose;
+    blocker->initial_pose = start_pose; // Sync
 
-    std::cout << "  [Relocate] Attempting to move " << blocker->name 
-              << " from (" << start_pose.x << ", " << start_pose.y << ")" << std::endl;
+    std::cout << "  [Relocate] Searching for clearing motion for " << blocker->name 
+              << " from (" << start_pose.x << ", " << start_pose.y << ")..." << std::endl;
 
-    auto candidates = generate_parking_candidates(start_pose, blocker, params);
+    // BFS / Dijkstra Structures
+    struct SearchNode {
+        double x, y, yaw;
+        double cost;
+        SearchNode* parent;
+        double steer;
+        int dir; // 1 or -1
+        
+        SearchNode(double _x, double _y, double _yaw, double _c, SearchNode* _p, double _s, int _d)
+            : x(_x), y(_y), yaw(_yaw), cost(_c), parent(_p), steer(_s), dir(_d) {}
+    };
     
-    for (const auto& cand : candidates) {
-        // Ensure we actually move away from the conflict spot
-        double move_dist = std::hypot(cand.pose.x - start_pose.x, cand.pose.y - start_pose.y);
-        if (blocked_traj_hint && move_dist < 0.1) {
-             continue; // Don't just stay put if we are blocking something
+    auto cmp = [](const SearchNode* a, const SearchNode* b) { return a->cost > b->cost; };
+    std::priority_queue<SearchNode*, std::vector<SearchNode*>, decltype(cmp)> open_set(cmp);
+    std::vector<std::unique_ptr<SearchNode>> all_nodes;
+    
+    SearchNode* start_node = new SearchNode(start_pose.x, start_pose.y, start_pose.yaw, 0.0, nullptr, 0.0, 0);
+    all_nodes.emplace_back(start_node);
+    open_set.push(start_node);
+    
+    // Visited set (discretized)
+    std::unordered_set<std::string> visited;
+    auto get_key = [&](double x, double y, double yaw) {
+        int ix = static_cast<int>(x / 0.05);
+        int iy = static_cast<int>(y / 0.05);
+        int iyaw = static_cast<int>(yaw / 0.1);
+        return std::to_string(ix) + "_" + std::to_string(iy) + "_" + std::to_string(iyaw);
+    };
+    visited.insert(get_key(start_pose.x, start_pose.y, start_pose.yaw));
+
+    // Primitives
+    double step_size = 0.25;
+    std::vector<int> dirs = {1, -1};
+    double max_curv = 1.0 / blocker->min_turning_radius;
+    // Straight, Left, Right
+    std::vector<double> curvatures = {0.0, max_curv, -max_curv}; 
+    
+    int max_iter = 2000;
+    int iter = 0;
+    
+    while (!open_set.empty()) {
+        SearchNode* current = open_set.top();
+        open_set.pop();
+        iter++;
+        
+        if (iter > max_iter) {
+            std::cout << "  [Relocate] Max iterations reached." << std::endl;
+            break;
         }
 
-        bool conflict = false;
+        // Check if Current is Safe Parking Spot
+        // 1. Check against blocked_traj_hint (The main reason we are moving)
+        bool conflict_hint = false;
+        Corners curr_corners = get_corners(current->x, current->y, current->yaw, 
+                                           blocker->size.front_length, blocker->size.rear_length, blocker->size.width);
+        
+        // Bounds Check
+        if (!is_in_bounds(curr_corners, params.min_x, params.max_x, params.min_y, params.max_y)) {
+            continue; // Invalid node, don't expand
+        }
+                                           
         if (blocked_traj_hint) {
-            Corners cand_corners = get_corners(cand.pose.x, cand.pose.y, cand.pose.yaw, 
-                                             blocker->size.front_length, blocker->size.rear_length, blocker->size.width);
-            for (size_t i = 0; i < blocked_traj_hint->waypoints.size(); i += 5) {
+            // Check intersection with the *entire* blocked trajectory
+            // Optimization: checking every waypoint is slow. Check strided.
+            for (size_t i = 0; i < blocked_traj_hint->waypoints.size(); i += 2) { // Dense check
                 const auto& wp = blocked_traj_hint->waypoints[i];
-                Corners wp_corners = get_corners(wp.x, wp.y, wp.yaw, 
-                                               blocker->size.front_length, blocker->size.rear_length, blocker->size.width); 
-                if (rectangles_intersect(cand_corners, wp_corners)) {
-                    conflict = true; 
+                 Corners wp_corners = get_corners(wp.x, wp.y, wp.yaw, 
+                                                blocker->size.front_length, blocker->size.rear_length, blocker->size.width); 
+                if (rectangles_intersect(curr_corners, wp_corners)) {
+                    conflict_hint = true; 
                     break;
                 }
             }
         }
-        if (conflict) continue;
         
-        PHAStar planner(blocker, cand.pose, &timetable, &entities, params, false, "", ready_time);
-        
-        // OPTIMIZATION: Set strict iteration limit for parking search.
-        // If a spot is hard to reach, it's likely bad. Fail fast and try next.
-        planner.max_search_iterations = 2000; 
-        
-        auto res = planner.Planning_with_res(ready_time);
-        
-        if (res.status == PlanningStatus::SUCCESS) {
+        // 2. Check Other Static/Dynamic Obstacles at ready_time?
+        // Since we park, we should check if we collide with anything currently there.
+        // We assume other robots are moving, but we only care if we hit them *now*.
+        bool conflict_env = false;
+        if (!conflict_hint) {
+             // Validate against timetable at ready_time
+             // We reuse check_pose_collision logic or similar
+             // But we don't have easy access to check_pose_collision here (it's in PHAStar class).
+             // However, we have `timetable`.
+             auto poses = timetable.get_poses(ready_time);
+             CollisionGeometry my_geom = setup_collision_geometry({current->x, current->y, current->yaw}, blocker->size, params.inflation);
+             
+             for(auto& [ent, p] : poses) {
+                 if (ent == blocker) continue;
+                 // Don't check against the robot who owns blocked_traj_hint (we already checked hint)
+                 if (blocked_traj_hint && ent == blocked_traj_hint->entity) continue; 
+                 
+                 // Use standard collision check
+                 if (check_entity_collision(my_geom, {current->x, current->y, current->yaw}, ent, p, params).has_collision) {
+                     conflict_env = true;
+                     break;
+                 }
+             }
+        }
+
+        if (!conflict_hint && !conflict_env) {
+            // Found a valid spot!
+            // Reconstruct Path
+            std::vector<Waypoint> path;
+            SearchNode* node = current;
+            while(node->parent) {
+                Waypoint wp;
+                wp.x = node->x;
+                wp.y = node->y;
+                wp.yaw = node->yaw;
+                wp.steering_angle = std::atan(node->steer * blocker->wheel_base); // k = tan(delta)/L -> tan(delta) = k*L
+                wp.linear_velocity = node->dir * blocker->speed_transit;
+                path.push_back(wp);
+                node = node->parent;
+            }
+            // Add start
+            Waypoint start_wp(start_pose);
+            start_wp.time = 0; 
+            path.push_back(start_wp);
+            std::reverse(path.begin(), path.end());
+            
+            // Assign time
+            double t = ready_time;
+            for(size_t i=0; i<path.size(); ++i) {
+                if(i > 0) {
+                     double d = std::hypot(path[i].x - path[i-1].x, path[i].y - path[i-1].y);
+                     t += d / blocker->speed_transit;
+                }
+                path[i].time = t;
+            }
+            
+            // Register
             Trajectory relo_traj;
             relo_traj.entity = blocker;
             relo_traj.start_time = ready_time;
-            relo_traj.waypoints = res.waypoints;
+            relo_traj.waypoints = path;
              for (auto &wp : relo_traj.waypoints)
                 wp.time -= ready_time;
             timetable.add_trajectory(relo_traj);
-            std::cout << "  [Relocate] SUCCESS: Moved " << blocker->name 
-                      << " to (" << cand.pose.x << ", " << cand.pose.y << ")" << std::endl;
+            
+            std::cout << "  [Relocate] SUCCESS: Clearing found at (" << current->x << ", " << current->y << ") with cost " << current->cost << std::endl;
             return true;
         }
+        
+        // Expand
+        for (int dir : dirs) {
+            for (double k : curvatures) {
+                 double d = dir * step_size;
+                 double x_new, y_new, yaw_new;
+                 
+                  if (std::abs(k) < 1e-5) {
+                    x_new = current->x + d * std::cos(current->yaw);
+                    y_new = current->y + d * std::sin(current->yaw);
+                    yaw_new = current->yaw;
+                } else {
+                    double R = 1.0 / k;
+                    double beta = d / R; // d = R*beta
+                    x_new = current->x + R * (std::sin(current->yaw + beta) - std::sin(current->yaw));
+                    y_new = current->y + R * (std::cos(current->yaw) - std::cos(current->yaw + beta));
+                    yaw_new = current->yaw + beta;
+                }
+                 while(yaw_new > M_PI) yaw_new -= 2*M_PI;
+                 while(yaw_new < -M_PI) yaw_new += 2*M_PI;
+                 
+                 std::string key = get_key(x_new, y_new, yaw_new);
+                 if (visited.count(key)) continue;
+                 
+                 // Penalty for switching direction or steer?
+                 double new_cost = current->cost + step_size;
+                 
+                 visited.insert(key);
+                 SearchNode* next_node = new SearchNode(x_new, y_new, yaw_new, new_cost, current, k, dir);
+                 all_nodes.emplace_back(next_node);
+                 open_set.push(next_node);
+            }
+        }
     }
-    std::cerr << "  [Relocate] FAILED: Could not find safe parking spot for " << blocker->name << std::endl;
+
+    std::cerr << "  [Relocate] FAILED: Could not find clearing motion within iteration limit." << std::endl;
     return false;
 }
 
@@ -883,7 +1075,8 @@ Task* get_task_at_time(RobotMeta* robot, double time) {
 }
 
 // Helper function to handle the scheduling of a single path segment
-void schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
+// Helper function to handle the scheduling of a single path segment
+bool schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
                            RobotMeta *robot, TimeTable &timetable,
                            const Params &params,
                            const std::unordered_map<std::string, EntityMeta *> &entities,
@@ -957,7 +1150,11 @@ void schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
                     last_relocated_robot_name = blocker->name;
                     last_relocation_time = check_time;
                     check_time -= step; // Retry same time
-                    // Relocation doesn't count as wait for the current robot, but blocker gets coin
+                } else {
+                    // Relocation Failed. Abort.
+                    std::cerr << "    [Abort] Unmovable blocker " << blocker->name << " on path." << std::endl;
+                    success = false;
+                    break;
                 }
             }
         }
@@ -975,13 +1172,14 @@ void schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
 
   if (safe_start_time < 0) {
        std::cerr << " [Error] Segment failed." << std::endl;
-       return; // Should propagate error really
+       return false; 
   }
 
   // 4. Update timestamps and add to timetable
   traj->start_time = safe_start_time;
   traj->CalcualteTimeStamps(robot);
   timetable.add_trajectory(*traj);
+  return true;
 }
 
 bool process_task_execution_instrumented(
@@ -1028,10 +1226,12 @@ bool process_task_execution_instrumented(
       size_t post_path_idx = 1;
 
       if (task.obsReloPaths->size() > post_path_idx) {
-        schedule_path_segment(task.obsReloPaths->at(push_path_idx), obs_meta,
-                              robot, timetable, params, entities, &task);
-        schedule_path_segment(task.obsReloPaths->at(post_path_idx), obs_meta,
-                              robot, timetable, params, entities, &task);
+      if (task.obsReloPaths->size() > post_path_idx) {
+        if (!schedule_path_segment(task.obsReloPaths->at(push_path_idx), obs_meta,
+                              robot, timetable, params, entities, &task)) return false;
+        if (!schedule_path_segment(task.obsReloPaths->at(post_path_idx), obs_meta,
+                              robot, timetable, params, entities, &task)) return false;
+      }
       }
     }
   }
@@ -1089,6 +1289,10 @@ bool process_task_execution_instrumented(
                             last_relocated_robot = blocker->name;
                             last_relocation_time = check_time;
                             check_time -= step; 
+                        } else {
+                             std::cerr << "    [Abort] Unmovable blocker " << blocker->name << " on path (EdgePath)." << std::endl;
+                             seg_success = false;
+                             break;
                         }
                     }
                  }
@@ -1123,7 +1327,8 @@ bool process_task_execution_instrumented(
 
 void solve_allocation(std::vector<Task>& tasks, std::vector<RobotMeta*>& robots, 
                       TimeTable& timetable, const Params& params,
-                      const std::unordered_map<std::string, EntityMeta *>& entities) {
+                      const std::unordered_map<std::string, EntityMeta *>& entities,
+                      const std::map<int, std::string>& tabu_list = {}) {
     
     // Reset Robots
     for(auto* r : robots) {
@@ -1155,11 +1360,29 @@ void solve_allocation(std::vector<Task>& tasks, std::vector<RobotMeta*>& robots,
         if (!task.assignedRobot) {
              // Greedy Allocation
              auto candidates = get_sorted_candidate_robots(robots, timetable);
+             
+             // Check if this task has a banned robot
+             std::string banned_robot_name = "";
+             if (tabu_list.count(task.id)) {
+                 banned_robot_name = tabu_list.at(task.id);
+             }
+
+             // Sort candidates to put banned robot at the end (Soft Constraint)
+             // or just skip it (Hard Constraint)? 
+             // Let's do Soft Constraint: Try others first.
+             std::stable_sort(candidates.begin(), candidates.end(), 
+                [&](const auto& a, const auto& b) {
+                    bool a_is_banned = (a.first->name == banned_robot_name);
+                    bool b_is_banned = (b.first->name == banned_robot_name);
+                    return a_is_banned < b_is_banned; // False (0) comes before True (1)
+                });
+
              bool assigned = false;
              for(auto& [cand, t] : candidates) {
                  if (process_task_execution_instrumented(cand, task, timetable, entities, params)) {
                      task.assignedRobot = cand;
                      assigned = true;
+                     std::cout << "    [Alloc] Task " << task.id << " assigned to " << cand->name << std::endl;
                      break;
                  }
              }
@@ -1329,8 +1552,8 @@ int main(int argc, char **argv) {
   show_results(argc, argv, initial_timetable, entities, params);
 
   // --- 5. ALNS Loop ---
-  int max_iterations = 5;
-  int destroy_count = 3;
+  int max_iterations = 10;
+  int destroy_count = 2;
 
   struct IterationLog {
       int iter;
@@ -1349,6 +1572,8 @@ int main(int argc, char **argv) {
       
       // 1. Destroy
       std::vector<int> currently_destroyed;
+      std::map<int, std::string> tabu_list; // Map TaskID -> RobotName
+
       std::stringstream heuristics_ss;
       
       std::vector<std::pair<double, int>> weights;
@@ -1360,45 +1585,33 @@ int main(int argc, char **argv) {
           weights.push_back({w, i});
       }
       
-      std::random_device rd;
-      std::mt19937 gen(rd());
-      std::cout << "  [Destroy] Selecting " << destroy_count << " tasks..." << std::endl;
+      // Deterministic destroy: top-k highest weight tasks
+      std::sort(weights.rbegin(), weights.rend());
+      std::cout << "  [Destroy] Selecting top " << destroy_count << " tasks by weight..." << std::endl;
       
-      for(int k=0; k<destroy_count; ++k) {
-          if (weights.empty()) break;
-          double total_w = 0;
-          for(auto& p : weights) total_w += p.first;
-          std::uniform_real_distribution<> dist(0, total_w);
-          double r = dist(gen);
-          double acc = 0;
-          int selected_idx = -1;
-          int vec_idx = -1;
-          for(size_t i=0; i<weights.size(); ++i) {
-              acc += weights[i].first;
-              if (acc >= r) {
-                  selected_idx = weights[i].second;
-                  vec_idx = i;
-                  break;
-              }
+      for(int k=0; k<destroy_count && k<static_cast<int>(weights.size()); ++k) {
+          int selected_idx = weights[k].second;
+          
+          // Record Tabu info BEFORE destroying assignment
+          if (tasks[selected_idx].assignedRobot) {
+              tabu_list[tasks[selected_idx].id] = tasks[selected_idx].assignedRobot->name;
           }
-          if (selected_idx != -1) {
-              tasks[selected_idx].assignedRobot = nullptr;
-              currently_destroyed.push_back(tasks[selected_idx].id);
-              
-              // Determine dominant heuristic
-              std::string reason = "Random";
-              double b = tasks[selected_idx].blocker_coins;
-              double w = tasks[selected_idx].waiter_coins;
-              double d = tasks[selected_idx].deadlock_coins;
-              if (d > 0) reason = "Deadlock(" + std::to_string(int(d)) + ")";
-              else if (b > w && b > 1) reason = "Blocker(" + std::to_string(int(b)) + ")";
-              else if (w > b && w > 1) reason = "Waiter(" + std::to_string(int(w)) + ")";
-              
-              heuristics_ss << "T" << tasks[selected_idx].id << ":" << reason << " ";
-              
-              std::cout << "    -> Removed Task " << tasks[selected_idx].id << " [" << reason << "]" << std::endl;
-              weights.erase(weights.begin() + vec_idx);
-          }
+
+          tasks[selected_idx].assignedRobot = nullptr;
+          currently_destroyed.push_back(tasks[selected_idx].id);
+          
+          // Determine dominant heuristic
+          std::string reason = "TopWeight";
+          double b = tasks[selected_idx].blocker_coins;
+          double w = tasks[selected_idx].waiter_coins;
+          double d = tasks[selected_idx].deadlock_coins;
+          if (d > 0) reason = "Deadlock(" + std::to_string(static_cast<int>(d)) + ")";
+          else if (b > w && b > 1) reason = "Blocker(" + std::to_string(static_cast<int>(b)) + ")";
+          else if (w > b && w > 1) reason = "Waiter(" + std::to_string(static_cast<int>(w)) + ")";
+          
+          heuristics_ss << "T" << tasks[selected_idx].id << ":" << reason << " ";
+          
+          std::cout << "    -> Removed Task " << tasks[selected_idx].id << " [" << reason << ", w=" << weights[k].first << "]" << std::endl;
       }
       
       // 2. Clear coins
@@ -1413,7 +1626,7 @@ int main(int argc, char **argv) {
       TimeTable current_timetable(0.5);
       current_timetable.add_initial(entities);
       
-      solve_allocation(tasks, all_robots, current_timetable, params, entities);
+      solve_allocation(tasks, all_robots, current_timetable, params, entities, tabu_list);
       
       double current_makespan = current_timetable.get_max_time();
       
