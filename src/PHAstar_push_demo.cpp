@@ -1371,6 +1371,31 @@ void solve_allocation(std::vector<Task>& tasks, std::vector<RobotMeta*>& robots,
     }
     
     clear_timeline();
+
+    // Atomic task attempt: if planning fails, rollback any partial side-effects.
+    auto try_process_task_atomic = [&](RobotMeta* candidate, Task& task) {
+      TimeTable timetable_backup = timetable;
+      double blocker_backup = task.blocker_coins;
+      double waiter_backup = task.waiter_coins;
+      double deadlock_backup = task.deadlock_coins;
+
+      std::map<RobotMeta*, Pose> robot_pose_backup;
+      for (auto* r : robots) {
+        robot_pose_backup[r] = r->initial_pose;
+      }
+
+      bool ok = process_task_execution_instrumented(candidate, task, timetable, entities, params);
+      if (!ok) {
+        timetable = timetable_backup;
+        task.blocker_coins = blocker_backup;
+        task.waiter_coins = waiter_backup;
+        task.deadlock_coins = deadlock_backup;
+        for (const auto& [r, pose] : robot_pose_backup) {
+          r->initial_pose = pose;
+        }
+      }
+      return ok;
+    };
     
     int task_idx = 0;
     for(auto& task : tasks) {
@@ -1382,7 +1407,7 @@ void solve_allocation(std::vector<Task>& tasks, std::vector<RobotMeta*>& robots,
              // Pre-assigned (kept)
              // We still need to re-plan the PATH because other robots might have changed schedules.
              // "From here, we need to do the necessary path planning from scratch"
-             if (!process_task_execution_instrumented(task.assignedRobot, task, timetable, entities, params)) {
+           if (!try_process_task_atomic(task.assignedRobot, task)) {
                  // Feasibility failed?
                  std::cerr << " [Warn] Task " << task.id << " failed with pre-assigned " << task.assignedRobot->name << ". Re-allocating..." << std::endl;
                  task.assignedRobot = nullptr; // Fall through to re-allocation
@@ -1409,7 +1434,7 @@ void solve_allocation(std::vector<Task>& tasks, std::vector<RobotMeta*>& robots,
            // Pass 1: Try non-avoided robots first.
            for(auto& [cand, t] : candidates) {
              if (avoided_robot_names.count(cand->name)) continue;
-             if (process_task_execution_instrumented(cand, task, timetable, entities, params)) {
+             if (try_process_task_atomic(cand, task)) {
                task.assignedRobot = cand;
                assigned = true;
                std::cout << "    [Alloc] Task " << task.id << " assigned to " << cand->name << " (non-avoided)" << std::endl;
@@ -1420,7 +1445,7 @@ void solve_allocation(std::vector<Task>& tasks, std::vector<RobotMeta*>& robots,
            // Pass 2: Feasibility fallback (allow avoided robots).
            if (!assigned) {
              for(auto& [cand, t] : candidates) {
-               if (process_task_execution_instrumented(cand, task, timetable, entities, params)) {
+               if (try_process_task_atomic(cand, task)) {
                  task.assignedRobot = cand;
                  assigned = true;
                  std::cout << "    [Alloc] Task " << task.id << " assigned to " << cand->name;
@@ -1576,7 +1601,8 @@ int main(int argc, char **argv) {
            }
            if (collision_count > 5) break; // Limit output
        }
-       if(collision_count == 0) std::cout << "  [Verify] No collisions detected." << std::endl;
+           if(collision_count == 0) std::cout << "  [Verify] No collisions detected." << std::endl;
+           return collision_count > 0;
   };
 
   // --- 4. Initial Greedy Allocation ---
@@ -1589,7 +1615,10 @@ int main(int argc, char **argv) {
   
   double initial_makespan = initial_timetable.get_max_time();
   std::cout << "[Result] Initial Solution Makespan: " << initial_makespan << "s" << std::endl;
-  verify_collisions(initial_timetable, initial_makespan);
+  bool initial_has_collision = verify_collisions(initial_timetable, initial_makespan);
+  if (initial_has_collision) {
+      initial_timetable.print_grouped_entries_by_trajectory();
+  }
 
     // Keep initial greedy owner per task, to avoid reusing the same robot in repair if possible.
     std::map<int, std::string> initial_owner_by_task;
@@ -1687,6 +1716,7 @@ int main(int argc, char **argv) {
       // 3. Repair (Solve)
       reset_robots(); 
       TimeTable current_timetable(0.5);
+      current_timetable.set_capture_registration_snapshots(true);
       current_timetable.add_initial(entities);
       
       solve_allocation(tasks, all_robots, current_timetable, params, entities, tabu_list, initial_owner_by_task);
@@ -1726,7 +1756,15 @@ int main(int argc, char **argv) {
       }
       std::cout << std::endl;
       
-      verify_collisions(current_timetable, current_makespan);
+        bool has_collision = verify_collisions(current_timetable, current_makespan);
+        if (has_collision) {
+          std::cout << "  [Debug] Collision found. Printing timetable groups by trajectory..." << std::endl;
+          current_timetable.print_grouped_entries_by_trajectory();
+
+          const auto& snaps = current_timetable.get_registration_snapshots();
+          std::cout << "  [Debug] Opening advanced replay visualizer for " << snaps.size() << " registered trajectories..." << std::endl;
+          show_trajectory_registration_replay(current_timetable, entities, params);
+        }
       
       // 4. Visualize (Skipped per request/comment)
       if(show_plan_result)

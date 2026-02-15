@@ -16,6 +16,7 @@
 #include <QSlider>
 #include <QDockWidget>
 #include <QHBoxLayout>
+#include <QVBoxLayout>
 #include <QLabel>
 #include <QDialog>
 #include <QDebug>
@@ -23,6 +24,9 @@
 #include <QDoubleSpinBox>
 #include <QTimer>
 #include <QFontMetrics>
+#include <QListWidget>
+#include <QSplitter>
+#include <QCheckBox>
 
 #include <vector>
 
@@ -342,6 +346,331 @@ void show_results(int argc, char** argv, const TimeTable& timetable, const std::
     win.resize(600, 600);
     win.show();
     app.exec();
+}
+
+class TrajectoryReplayVizWidget : public QWidget {
+public:
+    TrajectoryReplayVizWidget(const std::unordered_map<std::string, EntityMeta*>& ents,
+                              const Params& p,
+                              QWidget* parent = nullptr)
+        : QWidget(parent), entities(ents), params(p) {
+        setMinimumSize(700, 700);
+    }
+
+    void setTime(double t) {
+        current_t = t;
+        update();
+    }
+
+    void setSnapshot(const TimeTable* tt,
+                     const TimeTable::TrajectoryLabel* label,
+                     int idx,
+                     int total_count) {
+        snapshot_tt = tt;
+        selected_label = label;
+        selected_index = idx;
+        selected_total = total_count;
+        update();
+    }
+
+    void setFinalTimeTable(const TimeTable* tt) {
+        final_tt = tt;
+        update();
+    }
+
+    void setShowFinalMode(bool enabled) {
+        show_final_mode = enabled;
+        update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent*) override {
+        QPainter painter(this);
+        painter.setRenderHint(QPainter::Antialiasing);
+        painter.fillRect(rect(), Qt::white);
+
+        const TimeTable* active_tt = show_final_mode ? final_tt : snapshot_tt;
+        if (!active_tt) {
+            painter.setPen(Qt::black);
+            painter.drawText(rect(), Qt::AlignCenter, "No selected snapshot.");
+            return;
+        }
+
+        double scale_x = static_cast<double>(width()) / (params.max_x - params.min_x);
+        double scale_y = static_cast<double>(height()) / (params.max_y - params.min_y);
+        double sc = std::min(scale_x, scale_y);
+        auto screen_x = [&](double x) { return (x - params.min_x) * sc; };
+        auto screen_y = [&](double y) { return (params.max_y - y) * sc; };
+
+        painter.setPen(Qt::lightGray);
+        for (double x = params.min_x; x <= params.max_x + 1e-6; x += params.xy_resolution * 5) {
+            double sx = screen_x(x);
+            painter.drawLine(QPointF(sx, screen_y(params.min_y)), QPointF(sx, screen_y(params.max_y)));
+        }
+        for (double y = params.min_y; y <= params.max_y + 1e-6; y += params.xy_resolution * 5) {
+            double sy = screen_y(y);
+            painter.drawLine(QPointF(screen_x(params.min_x), sy), QPointF(screen_x(params.max_x), sy));
+        }
+
+        painter.setPen(QPen(Qt::black, 3));
+        painter.drawRect(QRectF(screen_x(params.min_x) + 1, screen_y(params.max_y) + 1,
+                                sc * (params.max_x - params.min_x) - 3,
+                                sc * (params.max_y - params.min_y) - 3));
+
+        auto poses = active_tt->get_poses(current_t);
+        for (const auto& [ent, pose] : poses) {
+            if (ent == nullptr) break;
+            QColor color = (ent->type == EntityType::ROBOT) ? QColor("#555B6E") : QColor("#89B0AE");
+            auto corners = get_corners(pose.x, pose.y, pose.yaw, ent->size.front_length, ent->size.rear_length, ent->size.width);
+            QPolygonF poly;
+            for (const auto& c : corners) poly << QPointF(screen_x(c.x), screen_y(c.y));
+            poly << QPointF(screen_x(corners[0].x), screen_y(corners[0].y));
+            painter.setPen(color);
+            painter.setBrush(color);
+            painter.drawPolygon(poly);
+
+            if (ent->type == EntityType::ROBOT) {
+                double front_x = pose.x + ent->size.front_length * std::cos(pose.yaw);
+                double front_y = pose.y + ent->size.front_length * std::sin(pose.yaw);
+                painter.setPen(QPen(QColor("FFD6BA"), 2));
+                painter.drawLine(screen_x(pose.x), screen_y(pose.y), screen_x(front_x), screen_y(front_y));
+            }
+
+            painter.setPen(Qt::black);
+            painter.drawText(QPointF(screen_x(pose.x), screen_y(pose.y)), QString::fromStdString(ent->name));
+        }
+
+        // Draw only the selected trajectory trace (last trajectory)
+        if (!show_final_mode && selected_label && selected_label->end_time >= selected_label->start_time) {
+            auto ent_it = entities.find(selected_label->entity_name);
+            if (ent_it != entities.end() && ent_it->second) {
+                EntityMeta* ent = ent_it->second;
+                QPolygonF trace;
+                double dt = std::max(0.05, params.xy_resolution);
+                for (double t = selected_label->start_time; t <= selected_label->end_time + 1e-6; t += dt) {
+                    Pose p = active_tt->get_pose(ent, t);
+                    trace << QPointF(screen_x(p.x), screen_y(p.y));
+                }
+                painter.setPen(QPen(QColor(255, 80, 0), 4));
+                painter.setBrush(Qt::NoBrush);
+                painter.drawPolyline(trace);
+            }
+        }
+
+        painter.setPen(Qt::black);
+        QString mode = show_final_mode ? "FINAL TIMETABLE" : "UP TO SELECTED PATH";
+        QString title = QString("[%1] Path %2/%3  Time: %4 s")
+                            .arg(mode)
+                            .arg(std::max(1, selected_index + 1))
+                            .arg(std::max(1, selected_total))
+                            .arg(current_t, 0, 'f', 2);
+        painter.drawText(QRect(8, 8, width() - 16, 20), Qt::AlignLeft, title);
+    }
+
+private:
+    const std::unordered_map<std::string, EntityMeta*>& entities;
+    const Params& params;
+    const TimeTable* snapshot_tt = nullptr;
+    const TimeTable* final_tt = nullptr;
+    const TimeTable::TrajectoryLabel* selected_label = nullptr;
+    int selected_index = -1;
+    int selected_total = 0;
+    double current_t = 0.0;
+    bool show_final_mode = false;
+};
+
+inline void show_trajectory_registration_replay(const TimeTable& timetable,
+                                                const std::unordered_map<std::string, EntityMeta*>& entities,
+                                                const Params& params) {
+    if (!QApplication::instance()) {
+        static int argc = 1;
+        static char arg[] = "traj_replay";
+        static char* argv[] = {arg};
+        new QApplication(argc, argv);
+    }
+
+    const auto& snapshots = timetable.get_registration_snapshots();
+    const auto& labels = timetable.get_trajectory_labels();
+
+    QDialog dialog;
+    dialog.setWindowTitle("Trajectory Registration Replay");
+    dialog.resize(1500, 900);
+
+    std::vector<TimeTable> snapshot_tables;
+    snapshot_tables.reserve(snapshots.size());
+    for (size_t i = 0; i < snapshots.size(); ++i) {
+        snapshot_tables.push_back(timetable.build_snapshot_timetable(i));
+    }
+
+    QVBoxLayout* root = new QVBoxLayout(&dialog);
+    QHBoxLayout* top = new QHBoxLayout();
+
+    TrajectoryReplayVizWidget* viz = new TrajectoryReplayVizWidget(entities, params);
+    QListWidget* list = new QListWidget;
+    list->setMinimumWidth(360);
+    viz->setFinalTimeTable(&timetable);
+
+    std::unordered_map<int, const TimeTable::TrajectoryLabel*> label_by_id;
+    for (const auto& m : labels) {
+        label_by_id[m.id] = &m;
+    }
+
+    // Keep exact insertion order: iterate snapshots in stored sequence.
+    for (size_t i = 0; i < snapshots.size(); ++i) {
+        const auto& s = snapshots[i];
+        const TimeTable::TrajectoryLabel* m = nullptr;
+        if (label_by_id.count(s.traj_id)) {
+            m = label_by_id[s.traj_id];
+        }
+
+        QString robot_name = QString::fromStdString(s.entity_name);
+        if (m && !m->entity_name.empty()) {
+            robot_name = QString::fromStdString(m->entity_name);
+        }
+
+        QString entry;
+        if (m) {
+            entry = QString("[%1] traj#%2 | robot=%3 | %4 -> %5")
+                        .arg(static_cast<int>(i) + 1)
+                        .arg(s.traj_id)
+                        .arg(robot_name)
+                        .arg(m->start_time, 0, 'f', 2)
+                        .arg(m->end_time, 0, 'f', 2);
+            if (m->is_transfer && !m->transferred_object_name.empty()) {
+                entry += QString(" | push %1").arg(QString::fromStdString(m->transferred_object_name));
+            }
+        } else {
+            entry = QString("[%1] traj#%2 | robot=%3")
+                        .arg(static_cast<int>(i) + 1)
+                        .arg(s.traj_id)
+                        .arg(robot_name);
+        }
+        list->addItem(entry);
+    }
+
+    QWidget* panel = new QWidget;
+    QHBoxLayout* ctrl = new QHBoxLayout(panel);
+    QCheckBox* modeToggle = new QCheckBox("Show final timetable result");
+    modeToggle->setChecked(false);
+
+    QSlider* slider = new QSlider(Qt::Horizontal);
+    slider->setRange(0, 0);
+    slider->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+
+    QLabel* timeLabel = new QLabel("Time: 0.00 s");
+    timeLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    timeLabel->setMinimumWidth(140);
+
+    QDoubleSpinBox* stepSpin = new QDoubleSpinBox();
+    stepSpin->setRange(0.01, 1000.0);
+    stepSpin->setSingleStep(0.05);
+    stepSpin->setDecimals(2);
+    stepSpin->setValue(0.50);
+    stepSpin->setSuffix(" s");
+
+    QPushButton* prevBtn = new QPushButton("<<");
+    QPushButton* nextBtn = new QPushButton(">>");
+    prevBtn->setAutoRepeat(true);
+    prevBtn->setAutoRepeatDelay(300);
+    prevBtn->setAutoRepeatInterval(100);
+    nextBtn->setAutoRepeat(true);
+    nextBtn->setAutoRepeatDelay(300);
+    nextBtn->setAutoRepeatInterval(100);
+
+    ctrl->addWidget(modeToggle);
+    ctrl->addSpacing(10);
+    ctrl->addWidget(new QLabel("Step:"));
+    ctrl->addWidget(stepSpin);
+    ctrl->addWidget(prevBtn);
+    ctrl->addWidget(slider);
+    ctrl->addWidget(nextBtn);
+    ctrl->addWidget(timeLabel);
+
+    QTimer* dragUpdateTimer = new QTimer(&dialog);
+    dragUpdateTimer->setInterval(50);
+
+    QObject::connect(dragUpdateTimer, &QTimer::timeout, [=]() {
+        viz->setTime(slider->value() / 100.0);
+    });
+
+    QObject::connect(slider, &QSlider::sliderPressed, [=]() {
+        dragUpdateTimer->start();
+    });
+
+    QObject::connect(slider, &QSlider::sliderReleased, [=]() {
+        dragUpdateTimer->stop();
+        viz->setTime(slider->value() / 100.0);
+    });
+
+    QObject::connect(slider, &QSlider::valueChanged, [=](int val) {
+        double t = val / 100.0;
+        timeLabel->setText(QString("Time: %1 s").arg(t, 0, 'f', 2));
+        if (!slider->isSliderDown()) {
+            viz->setTime(t);
+        }
+    });
+
+    QObject::connect(prevBtn, &QPushButton::clicked, [=]() {
+        double step = stepSpin->value();
+        double curr_t = slider->value() / 100.0;
+        double new_t = qMax(0.0, curr_t - step);
+        slider->setValue(static_cast<int>(new_t * 100 + 0.5));
+    });
+
+    QObject::connect(nextBtn, &QPushButton::clicked, [=]() {
+        double step = stepSpin->value();
+        double max_t = slider->maximum() / 100.0;
+        double curr_t = slider->value() / 100.0;
+        double new_t = qMin(max_t, curr_t + step);
+        slider->setValue(static_cast<int>(new_t * 100 + 0.5));
+    });
+
+    auto refresh_selection = [=]() {
+        int row = list->currentRow();
+        if (row < 0 || row >= static_cast<int>(snapshot_tables.size())) return;
+        const TimeTable* tt = &snapshot_tables[static_cast<size_t>(row)];
+        const TimeTable::TrajectoryLabel* label = nullptr;
+        int traj_id = snapshots[static_cast<size_t>(row)].traj_id;
+        auto label_it = label_by_id.find(traj_id);
+        if (label_it != label_by_id.end()) {
+            label = label_it->second;
+        }
+
+        viz->setSnapshot(tt, label, row, static_cast<int>(snapshot_tables.size()));
+        viz->setShowFinalMode(modeToggle->isChecked());
+
+        double max_t = modeToggle->isChecked() ? timetable.get_max_time() : tt->get_max_time();
+        int max_val = static_cast<int>(max_t * 100 + 0.5);
+        slider->setRange(0, std::max(0, max_val));
+        double t = slider->value() / 100.0;
+        if (t > max_t) {
+            slider->setValue(max_val);
+        } else {
+            viz->setTime(t);
+        }
+    };
+
+    QObject::connect(list, &QListWidget::currentRowChanged, &dialog, [=](int) {
+        refresh_selection();
+    });
+
+    QObject::connect(modeToggle, &QCheckBox::toggled, &dialog, [=](bool enabled) {
+        viz->setShowFinalMode(enabled);
+        (void)enabled;
+        refresh_selection();
+    });
+
+    top->addWidget(viz, 1);
+    top->addWidget(list, 0);
+    root->addLayout(top, 1);
+    root->addWidget(panel, 0);
+
+    if (list->count() > 0) {
+        list->setCurrentRow(list->count() - 1);
+        refresh_selection();
+    }
+
+    dialog.exec();
 }
 
 /**

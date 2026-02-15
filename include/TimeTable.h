@@ -5,6 +5,8 @@
 #include <iomanip>
 #include <map>
 #include <unordered_map>
+#include <vector>
+#include <string>
 
 #include <Entities.h>
 #include <Utils.h>  // Added for mod2pi
@@ -12,6 +14,22 @@
 
 class TimeTable {
 public:
+    struct TrajectoryLabel {
+        int id = -1;
+        std::string entity_name;
+        std::string transferred_object_name;
+        double start_time = 0.0;
+        double end_time = 0.0;
+        bool is_transfer = false;
+    };
+
+    struct RegistrationSnapshot {
+        int traj_id = -1;
+        std::string entity_name;
+        bool is_transfer = false;
+        std::unordered_map<EntityMeta*, std::map<double, Pose>> table;
+    };
+
     double time_increment = 0.5;
 
     TimeTable(double inc = 0.5) : time_increment(inc) {}
@@ -25,6 +43,7 @@ public:
     void add_trajectory(const Trajectory& traj) {
         EntityMeta* ent = traj.entity;
         if (traj.waypoints.empty()) return;
+        int traj_id = ++trajectory_seq;
         double min_relative = traj.waypoints.front().time;
         double max_relative = traj.waypoints.back().time;
         double offset = traj.start_time;
@@ -40,11 +59,13 @@ public:
             if (relative_t >= min_relative && relative_t <= max_relative) {
                 Pose p = interpolate_waypoints(traj.waypoints, relative_t);
                 per_entity_table[ent][absolute_t] = p;
+                per_entity_traj_label[ent][absolute_t] = traj_id;
                 if (traj.is_transfer && traj.transferred_object) {
                     Pose obj_p = compute_object_pose(p, ent->size, traj.transferred_object->size);
                     double delta_yaw = mod2pi(p.yaw - robot_start_yaw);
                     obj_p.yaw = mod2pi(initial_obj_yaw + delta_yaw);
                     per_entity_table[traj.transferred_object][absolute_t] = obj_p;
+                    per_entity_traj_label[traj.transferred_object][absolute_t] = traj_id;
                 }
             }
         }
@@ -52,20 +73,102 @@ public:
         double relative_min = min_relative;
         Pose p_min = interpolate_waypoints(traj.waypoints, relative_min);
         per_entity_table[ent][absolute_min_t] = p_min;
+        per_entity_traj_label[ent][absolute_min_t] = traj_id;
         if (traj.is_transfer && traj.transferred_object) {
             Pose obj_p_min = compute_object_pose(p_min, ent->size, traj.transferred_object->size);
             double delta_yaw = mod2pi(p_min.yaw - robot_start_yaw);
             obj_p_min.yaw = mod2pi(initial_obj_yaw + delta_yaw);
             per_entity_table[traj.transferred_object][absolute_min_t] = obj_p_min;
+            per_entity_traj_label[traj.transferred_object][absolute_min_t] = traj_id;
         }
         double relative_max = max_relative;
         Pose p_max = interpolate_waypoints(traj.waypoints, relative_max);
         per_entity_table[ent][absolute_max_t] = p_max;
+        per_entity_traj_label[ent][absolute_max_t] = traj_id;
         if (traj.is_transfer && traj.transferred_object) {
             Pose obj_p_max = compute_object_pose(p_max, ent->size, traj.transferred_object->size);
             double delta_yaw = mod2pi(p_max.yaw - robot_start_yaw);
             obj_p_max.yaw = mod2pi(initial_obj_yaw + delta_yaw);
             per_entity_table[traj.transferred_object][absolute_max_t] = obj_p_max;
+            per_entity_traj_label[traj.transferred_object][absolute_max_t] = traj_id;
+        }
+
+        TrajectoryLabel meta;
+        meta.id = traj_id;
+        meta.entity_name = ent ? ent->name : "UNKNOWN";
+        meta.transferred_object_name = (traj.transferred_object ? traj.transferred_object->name : "");
+        meta.start_time = absolute_min_t;
+        meta.end_time = absolute_max_t;
+        meta.is_transfer = traj.is_transfer;
+        trajectory_labels.push_back(meta);
+
+        if (capture_registration_snapshots) {
+            RegistrationSnapshot snap;
+            snap.traj_id = traj_id;
+            snap.entity_name = meta.entity_name;
+            snap.is_transfer = meta.is_transfer;
+            snap.table = per_entity_table;
+            registration_snapshots.push_back(std::move(snap));
+        }
+    }
+
+    void set_capture_registration_snapshots(bool enabled) {
+        capture_registration_snapshots = enabled;
+    }
+
+    const std::vector<TrajectoryLabel>& get_trajectory_labels() const {
+        return trajectory_labels;
+    }
+
+    const std::unordered_map<EntityMeta*, std::map<double, int>>& get_entity_trajectory_labels() const {
+        return per_entity_traj_label;
+    }
+
+    const std::vector<RegistrationSnapshot>& get_registration_snapshots() const {
+        return registration_snapshots;
+    }
+
+    TimeTable build_snapshot_timetable(size_t snapshot_idx) const {
+        TimeTable tt(time_increment);
+        if (snapshot_idx < registration_snapshots.size()) {
+            tt.per_entity_table = registration_snapshots[snapshot_idx].table;
+        }
+        return tt;
+    }
+
+    void print_grouped_entries_by_trajectory() const {
+        std::cout << "  [TimeTable] Grouped entries by trajectory label" << std::endl;
+        for (const auto& [ent, labels] : per_entity_traj_label) {
+            if (!ent) continue;
+            std::cout << "    - Entity " << ent->name << ":" << std::endl;
+            if (labels.empty()) {
+                std::cout << "      (no labeled entries)" << std::endl;
+                continue;
+            }
+            int current_id = -1;
+            double start_t = 0.0;
+            double end_t = 0.0;
+            bool first = true;
+            for (const auto& [t, id] : labels) {
+                if (first) {
+                    current_id = id;
+                    start_t = t;
+                    end_t = t;
+                    first = false;
+                    continue;
+                }
+                if (id == current_id) {
+                    end_t = t;
+                } else {
+                    std::cout << "      traj#" << current_id << " : [" << start_t << ", " << end_t << "]" << std::endl;
+                    current_id = id;
+                    start_t = t;
+                    end_t = t;
+                }
+            }
+            if (!first) {
+                std::cout << "      traj#" << current_id << " : [" << start_t << ", " << end_t << "]" << std::endl;
+            }
         }
     }
 
@@ -223,6 +326,11 @@ public:
 
 private:
     std::unordered_map<EntityMeta*, std::map<double, Pose>> per_entity_table;
+    std::unordered_map<EntityMeta*, std::map<double, int>> per_entity_traj_label;
+    std::vector<TrajectoryLabel> trajectory_labels;
+    std::vector<RegistrationSnapshot> registration_snapshots;
+    bool capture_registration_snapshots = false;
+    int trajectory_seq = 0;
 
     static Pose interpolate_pose(const Pose& p1, double t1, const Pose& p2, double t2, double t) {
         if (t1 == t2) return p1;
