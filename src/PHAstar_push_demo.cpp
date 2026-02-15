@@ -27,7 +27,7 @@
 
 
 const bool DEBUG_VIS = false;
-
+const bool show_plan_result = true;
 
 // ==========================================
 // 1. HELPER & UTILITY FUNCTIONS
@@ -514,7 +514,8 @@ bool relocate_blocking_robot(RobotMeta* blocker,
                              TimeTable& timetable, 
                              const Params& params,
                              const std::unordered_map<std::string, EntityMeta*>& entities,
-                             const Trajectory* blocked_traj_hint = nullptr) {
+                             const Trajectory* blocked_traj_hint = nullptr,
+                             bool* moved_out = nullptr) {
     
     double ready_time = timetable.get_entity_max_time(blocker);
     // Add small buffer
@@ -657,6 +658,19 @@ bool relocate_blocking_robot(RobotMeta* blocker,
                 path[i].time = t;
             }
             
+            // Detect no-op relocation (already at a valid clearing pose)
+            double moved_dist = std::hypot(current->x - start_pose.x, current->y - start_pose.y);
+            bool moved = (moved_dist > 0.05 || current->cost > 1e-6);
+            if (moved_out) {
+              *moved_out = moved;
+            }
+
+            if (!moved) {
+              std::cout << "  [Relocate] SKIP: " << blocker->name
+                    << " already clear at current pose. (cost=" << current->cost << ")" << std::endl;
+              return true;
+            }
+
             // Register
             Trajectory relo_traj;
             relo_traj.entity = blocker;
@@ -705,6 +719,9 @@ bool relocate_blocking_robot(RobotMeta* blocker,
     }
 
     std::cerr << "  [Relocate] FAILED: Could not find clearing motion within iteration limit." << std::endl;
+    if (moved_out) {
+        *moved_out = false;
+    }
     return false;
 }
 
@@ -1112,6 +1129,7 @@ bool schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
 
   std::string last_relocated_robot_name = "";
   double last_relocation_time = -100.0;
+  std::unordered_set<std::string> no_progress_blockers;
   
   // Track wait duration for this segment
   double wait_duration = 0.0;
@@ -1145,11 +1163,17 @@ bool schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
         double blocker_free_time = timetable.get_entity_max_time(blocker);
         if (col_info.time > blocker_free_time) {
             // Blocker is stationary. Relocate.
-             if (blocker->name != last_relocated_robot_name || (check_time - last_relocation_time > 5.0)) {
-                if (relocate_blocking_robot(blocker, timetable, params, entities, traj.get())) {
+           if (!no_progress_blockers.count(blocker->name) &&
+             (blocker->name != last_relocated_robot_name || (check_time - last_relocation_time > 5.0))) {
+            bool moved = false;
+            if (relocate_blocking_robot(blocker, timetable, params, entities, traj.get(), &moved)) {
                     last_relocated_robot_name = blocker->name;
                     last_relocation_time = check_time;
-                    check_time -= step; // Retry same time
+              if (moved) {
+                check_time -= step; // Retry same time only when blocker actually moved
+              } else {
+                no_progress_blockers.insert(blocker->name);
+              }
                 } else {
                     // Relocation Failed. Abort.
                     std::cerr << "    [Abort] Unmovable blocker " << blocker->name << " on path." << std::endl;
@@ -1261,6 +1285,7 @@ bool process_task_execution_instrumented(
     int max_retries = 200;
     std::string last_relocated_robot = "";
     double last_relocation_time = -100.0;
+    std::unordered_set<std::string> no_progress_blockers;
     double wait_val = 0.0;
     bool seg_success = false;
     
@@ -1284,11 +1309,17 @@ bool process_task_execution_instrumented(
                  
                  // Relocate logic
                  if (col_info.time > timetable.get_entity_max_time(blocker)) {
-                      if (blocker->name != last_relocated_robot || (check_time - last_relocation_time > 5.0)) {
-                        if (relocate_blocking_robot(blocker, timetable, params, entities, traj.get())) {
+                    if (!no_progress_blockers.count(blocker->name) &&
+                      (blocker->name != last_relocated_robot || (check_time - last_relocation_time > 5.0))) {
+                    bool moved = false;
+                    if (relocate_blocking_robot(blocker, timetable, params, entities, traj.get(), &moved)) {
                             last_relocated_robot = blocker->name;
                             last_relocation_time = check_time;
-                            check_time -= step; 
+                      if (moved) {
+                        check_time -= step;
+                      } else {
+                        no_progress_blockers.insert(blocker->name);
+                      }
                         } else {
                              std::cerr << "    [Abort] Unmovable blocker " << blocker->name << " on path (EdgePath)." << std::endl;
                              seg_success = false;
@@ -1328,7 +1359,8 @@ bool process_task_execution_instrumented(
 void solve_allocation(std::vector<Task>& tasks, std::vector<RobotMeta*>& robots, 
                       TimeTable& timetable, const Params& params,
                       const std::unordered_map<std::string, EntityMeta *>& entities,
-                      const std::map<int, std::string>& tabu_list = {}) {
+                      const std::map<int, std::string>& tabu_list = {},
+                      const std::map<int, std::string>& avoid_same_robot_list = {}) {
     
     // Reset Robots
     for(auto* r : robots) {
@@ -1361,31 +1393,46 @@ void solve_allocation(std::vector<Task>& tasks, std::vector<RobotMeta*>& robots,
              // Greedy Allocation
              auto candidates = get_sorted_candidate_robots(robots, timetable);
              
-             // Check if this task has a banned robot
-             std::string banned_robot_name = "";
-             if (tabu_list.count(task.id)) {
-                 banned_robot_name = tabu_list.at(task.id);
-             }
-
-             // Sort candidates to put banned robot at the end (Soft Constraint)
-             // or just skip it (Hard Constraint)? 
-             // Let's do Soft Constraint: Try others first.
-             std::stable_sort(candidates.begin(), candidates.end(), 
-                [&](const auto& a, const auto& b) {
-                    bool a_is_banned = (a.first->name == banned_robot_name);
-                    bool b_is_banned = (b.first->name == banned_robot_name);
-                    return a_is_banned < b_is_banned; // False (0) comes before True (1)
-                });
+           // Build avoid list (soft):
+           // 1) Iteration-level tabu (robot before destroy)
+           // 2) Initial greedy owner (persistent across LNS iterations)
+           std::unordered_set<std::string> avoided_robot_names;
+           if (tabu_list.count(task.id)) {
+             avoided_robot_names.insert(tabu_list.at(task.id));
+           }
+           if (avoid_same_robot_list.count(task.id)) {
+             avoided_robot_names.insert(avoid_same_robot_list.at(task.id));
+           }
 
              bool assigned = false;
-             for(auto& [cand, t] : candidates) {
-                 if (process_task_execution_instrumented(cand, task, timetable, entities, params)) {
-                     task.assignedRobot = cand;
-                     assigned = true;
-                     std::cout << "    [Alloc] Task " << task.id << " assigned to " << cand->name << std::endl;
-                     break;
-                 }
+
+           // Pass 1: Try non-avoided robots first.
+           for(auto& [cand, t] : candidates) {
+             if (avoided_robot_names.count(cand->name)) continue;
+             if (process_task_execution_instrumented(cand, task, timetable, entities, params)) {
+               task.assignedRobot = cand;
+               assigned = true;
+               std::cout << "    [Alloc] Task " << task.id << " assigned to " << cand->name << " (non-avoided)" << std::endl;
+               break;
              }
+           }
+
+           // Pass 2: Feasibility fallback (allow avoided robots).
+           if (!assigned) {
+             for(auto& [cand, t] : candidates) {
+               if (process_task_execution_instrumented(cand, task, timetable, entities, params)) {
+                 task.assignedRobot = cand;
+                 assigned = true;
+                 std::cout << "    [Alloc] Task " << task.id << " assigned to " << cand->name;
+                 if (avoided_robot_names.count(cand->name)) {
+                   std::cout << " (fallback on avoided robot)";
+                 }
+                 std::cout << std::endl;
+                 break;
+               }
+             }
+           }
+
              if (!assigned) {
                  std::cout << " [Fail] Task " << task.id << " could not be assigned (Deadlock)." << std::endl;
                  task.deadlock_coins += 10.0;
@@ -1543,17 +1590,26 @@ int main(int argc, char **argv) {
   double initial_makespan = initial_timetable.get_max_time();
   std::cout << "[Result] Initial Solution Makespan: " << initial_makespan << "s" << std::endl;
   verify_collisions(initial_timetable, initial_makespan);
+
+    // Keep initial greedy owner per task, to avoid reusing the same robot in repair if possible.
+    std::map<int, std::string> initial_owner_by_task;
+    for (const auto& task : tasks) {
+      if (task.assignedRobot) {
+        initial_owner_by_task[task.id] = task.assignedRobot->name;
+      }
+    }
   
   // Backup best solution
   double best_makespan = initial_makespan;
   TimeTable best_timetable = initial_timetable; // Store best found so far
   
   std::cout << "[System] Visualizing Initial Solution..." << std::endl;
-  show_results(argc, argv, initial_timetable, entities, params);
+  if(show_plan_result)
+    show_results(argc, argv, initial_timetable, entities, params);
 
   // --- 5. ALNS Loop ---
-  int max_iterations = 10;
-  int destroy_count = 2;
+  int max_iterations = 5;
+  int destroy_count = 3;
 
   struct IterationLog {
       int iter;
@@ -1561,14 +1617,21 @@ int main(int argc, char **argv) {
       std::vector<int> destroyed_tasks;
       std::string heuristics_info;
       double improvement;
+      std::vector<std::string> allocation_changes;
   };
   std::vector<IterationLog> history;
   
   // Record initial
-  history.push_back({0, initial_makespan, {}, "Initial Greedy", 0.0});
+  history.push_back({0, initial_makespan, {}, "Initial Greedy", 0.0, {}});
 
   for (int iter = 1; iter <= max_iterations; ++iter) {
       std::cout << "\n\n=== ALNS Iteration " << iter << " ===" << std::endl;
+
+      // Snapshot allocation before destroy/repair
+      std::map<int, std::string> alloc_before;
+      for (const auto& t : tasks) {
+        alloc_before[t.id] = t.assignedRobot ? t.assignedRobot->name : "UNASSIGNED";
+      }
       
       // 1. Destroy
       std::vector<int> currently_destroyed;
@@ -1626,9 +1689,23 @@ int main(int argc, char **argv) {
       TimeTable current_timetable(0.5);
       current_timetable.add_initial(entities);
       
-      solve_allocation(tasks, all_robots, current_timetable, params, entities, tabu_list);
+      solve_allocation(tasks, all_robots, current_timetable, params, entities, tabu_list, initial_owner_by_task);
       
       double current_makespan = current_timetable.get_max_time();
+
+        // Snapshot allocation after repair and build per-task allocation changes
+        std::map<int, std::string> alloc_after;
+        for (const auto& t : tasks) {
+          alloc_after[t.id] = t.assignedRobot ? t.assignedRobot->name : "UNASSIGNED";
+        }
+        std::vector<std::string> alloc_changes;
+        alloc_changes.reserve(tasks.size());
+        for (const auto& t : tasks) {
+          std::string obj_name = (t.targetObject ? t.targetObject->name : "unknown_obj");
+          std::string before = alloc_before.count(t.id) ? alloc_before.at(t.id) : "UNASSIGNED";
+          std::string after = alloc_after.count(t.id) ? alloc_after.at(t.id) : "UNASSIGNED";
+          alloc_changes.push_back("T" + std::to_string(t.id) + "(" + obj_name + "): " + before + " -> " + after);
+        }
       
       // Log result
       IterationLog log_entry;
@@ -1637,6 +1714,7 @@ int main(int argc, char **argv) {
       log_entry.destroyed_tasks = currently_destroyed;
       log_entry.heuristics_info = heuristics_ss.str();
       log_entry.improvement = initial_makespan - current_makespan; // Relative to initial
+        log_entry.allocation_changes = std::move(alloc_changes);
       
       history.push_back(log_entry);
 
@@ -1651,8 +1729,11 @@ int main(int argc, char **argv) {
       verify_collisions(current_timetable, current_makespan);
       
       // 4. Visualize (Skipped per request/comment)
-      // std::cout << "[System] Visualizing Iteration " << iter << "..." << std::endl;
-      // show_results(argc, argv, current_timetable, entities, params);
+      if(show_plan_result)
+      {
+        std::cout << "[System] Visualizing Iteration " << iter << "..." << std::endl;
+        show_results(argc, argv, current_timetable, entities, params);
+      }
   }
 
   // --- Final Summary ---
@@ -1672,6 +1753,13 @@ int main(int argc, char **argv) {
           std::cout << log.heuristics_info;
       }
       std::cout << std::endl;
+
+        if (log.iter > 0) {
+          std::cout << "      Allocation (Task(Object): initial -> new):" << std::endl;
+          for (const auto& line : log.allocation_changes) {
+            std::cout << "        - " << line << std::endl;
+          }
+        }
   }
   std::cout << "=========================================" << std::endl;
   std::cout << "Best Makespan Found: " << best_makespan << "s" << std::endl;
