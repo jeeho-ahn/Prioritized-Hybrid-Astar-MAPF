@@ -1313,6 +1313,10 @@ bool schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
   traj->entity = robot;
   traj->CalcualteTimeStamps(robot);
 
+  int force_clear_retry_count = 0;
+
+schedule_retry:
+
   // 3. Find safe start time
   // We need to intercept find_safe_start_time to record coins, but function signature is fixed.
   // Instead, let's copy the logic of find_safe_start_time here or wrap it. 
@@ -1456,6 +1460,22 @@ bool schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
                  << " relocate_failures=" << relocation_failures
                  << std::endl;
 
+       // Force-clear fallback: if blocked by a robot, relocate blocker and retry once.
+       if (force_clear_retry_count == 0 && !last_motion_collision.is_valid &&
+           entities.count(last_motion_collision.entity_name)) {
+         EntityMeta* maybe_blocker = entities.at(last_motion_collision.entity_name);
+         if (maybe_blocker && maybe_blocker->type == EntityType::ROBOT) {
+           RobotMeta* blocker = dynamic_cast<RobotMeta*>(maybe_blocker);
+           bool moved = false;
+           if (relocate_blocking_robot(blocker, timetable, params, entities, traj.get(), &moved)) {
+             force_clear_retry_count++;
+             std::cout << "  [ForceClear] schedule_path_segment retry after relocating blocker "
+                       << blocker->name << " moved=" << (moved ? "Y" : "N") << std::endl;
+             goto schedule_retry;
+           }
+         }
+       }
+
          visualize_segment_failure_instance(
            timetable, entities, params, *traj, check_time, last_motion_collision,
            "schedule_path_segment task=" + std::to_string(current_task->id));
@@ -1556,6 +1576,10 @@ bool process_task_execution_instrumented(
     
     TrajectoryPtr traj = path_ptr; // Shared ptr
     // traj->entity/timestamps already set
+
+    int force_clear_retry_count = 0;
+
+  edge_retry:
     
     // Inline Safe Start Instrumented
     double check_time = segment_ready_time;
@@ -1671,6 +1695,24 @@ bool process_task_execution_instrumented(
         std::cerr << " relocate_attempts=" << relocation_attempts
                   << " relocate_failures=" << relocation_failures
                   << std::endl;
+
+        // Force-clear fallback: if blocked by a robot, relocate blocker and retry once.
+        if (force_clear_retry_count == 0 && !last_motion_collision.is_valid &&
+            entities.count(last_motion_collision.entity_name)) {
+          EntityMeta* maybe_blocker = entities.at(last_motion_collision.entity_name);
+          if (maybe_blocker && maybe_blocker->type == EntityType::ROBOT) {
+            RobotMeta* blocker = dynamic_cast<RobotMeta*>(maybe_blocker);
+            bool moved = false;
+            if (relocate_blocking_robot(blocker, timetable, params, entities, traj.get(), &moved)) {
+              force_clear_retry_count++;
+              std::cout << "  [ForceClear] edge_loop task=" << task.id
+                        << " edge_idx=" << path_i
+                        << " retry after relocating blocker " << blocker->name
+                        << " moved=" << (moved ? "Y" : "N") << std::endl;
+              goto edge_retry;
+            }
+          }
+        }
 
         visualize_segment_failure_instance(
           timetable, entities, params, *traj, check_time, last_motion_collision,
