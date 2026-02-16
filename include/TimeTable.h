@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 #include <string>
+#include <sstream>
 
 #include <Entities.h>
 #include <Utils.h>  // Added for mod2pi
@@ -33,6 +34,10 @@ public:
     double time_increment = 0.5;
 
     TimeTable(double inc = 0.5) : time_increment(inc) {}
+
+    void set_color_log_enabled(bool enabled) {
+        color_log_enabled = enabled;
+    }
 
     void add_initial(const std::unordered_map<std::string, EntityMeta*>& entities) {
         for (const auto& [name, ent] : entities) {
@@ -110,6 +115,8 @@ public:
             snap.table = per_entity_table;
             registration_snapshots.push_back(std::move(snap));
         }
+
+        print_path_add_log(meta);
     }
 
     void set_capture_registration_snapshots(bool enabled) {
@@ -325,11 +332,37 @@ public:
     }
 
 private:
+    void print_path_add_log(const TrajectoryLabel& meta) const {
+        std::ostringstream ss;
+        ss << std::fixed << std::setprecision(2);
+
+        int list_idx = capture_registration_snapshots ? static_cast<int>(registration_snapshots.size()) : -1;
+        std::string list_prefix = (list_idx > 0)
+            ? ("[" + std::to_string(list_idx) + "] ")
+            : "[--] ";
+
+        ss << "      " << list_prefix
+           << "traj#" << meta.id
+           << " | robot=" << meta.entity_name
+           << " | " << meta.start_time << " -> " << meta.end_time;
+
+        if (meta.is_transfer && !meta.transferred_object_name.empty()) {
+            ss << " | push " << meta.transferred_object_name;
+        }
+
+        if (color_log_enabled) {
+            std::cout << "\033[1;36m" << ss.str() << "\033[0m" << std::endl;
+        } else {
+            std::cout << ss.str() << std::endl;
+        }
+    }
+
     std::unordered_map<EntityMeta*, std::map<double, Pose>> per_entity_table;
     std::unordered_map<EntityMeta*, std::map<double, int>> per_entity_traj_label;
     std::vector<TrajectoryLabel> trajectory_labels;
     std::vector<RegistrationSnapshot> registration_snapshots;
     bool capture_registration_snapshots = false;
+    bool color_log_enabled = true;
     int trajectory_seq = 0;
 
     static Pose interpolate_pose(const Pose& p1, double t1, const Pose& p2, double t2, double t) {

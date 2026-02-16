@@ -28,6 +28,7 @@
 
 const bool DEBUG_VIS = false;
 const bool show_plan_result = true;
+constexpr double TIMETABLE_MARGIN = 0.5;
 
 // ==========================================
 // 1. HELPER & UTILITY FUNCTIONS
@@ -566,6 +567,7 @@ bool relocate_blocking_robot(RobotMeta* blocker,
     
     int max_iter = 2000;
     int iter = 0;
+    int future_wait_rejects = 0;
     
     while (!open_set.empty()) {
         SearchNode* current = open_set.top();
@@ -588,23 +590,38 @@ bool relocate_blocking_robot(RobotMeta* blocker,
             continue; // Invalid node, don't expand
         }
                                            
-        if (blocked_traj_hint) {
-            // Check intersection with the *entire* blocked trajectory
-            // Optimization: checking every waypoint is slow. Check strided.
-            for (size_t i = 0; i < blocked_traj_hint->waypoints.size(); i += 2) { // Dense check
-                const auto& wp = blocked_traj_hint->waypoints[i];
-                 Corners wp_corners = get_corners(wp.x, wp.y, wp.yaw, 
-                                                blocker->size.front_length, blocker->size.rear_length, blocker->size.width); 
-                if (rectangles_intersect(curr_corners, wp_corners)) {
-                    conflict_hint = true; 
-                    break;
-                }
+        if (blocked_traj_hint && !blocked_traj_hint->waypoints.empty()) {
+          // Check intersection against continuous hinted trajectory in time (dense interpolation).
+          double hint_duration = blocked_traj_hint->waypoints.back().time;
+          double dt_hint = 0.1;
+          for (double t_hint = 0.0; t_hint <= hint_duration + 1e-6; t_hint += dt_hint) {
+            auto pose_tuple = interpolate_timed_path(blocked_traj_hint->waypoints, t_hint);
+            Pose wp_pose{std::get<0>(pose_tuple), std::get<1>(pose_tuple), std::get<2>(pose_tuple)};
+
+            Corners wp_corners = get_corners(wp_pose.x, wp_pose.y, wp_pose.yaw,
+                             blocker->size.front_length, blocker->size.rear_length, blocker->size.width);
+            if (rectangles_intersect(curr_corners, wp_corners)) {
+              conflict_hint = true;
+              break;
             }
+
+            // If hinted trajectory is a transfer, also check the pushed object's footprint.
+            if (blocked_traj_hint->is_transfer && blocked_traj_hint->transferred_object) {
+              EntityMeta* tr_obj = blocked_traj_hint->transferred_object;
+              Pose obj_pose = TimeTable::compute_object_pose(wp_pose, blocker->size, tr_obj->size);
+              Corners obj_corners = get_corners(obj_pose.x, obj_pose.y, obj_pose.yaw,
+                                tr_obj->size.front_length,
+                                tr_obj->size.rear_length,
+                                tr_obj->size.width);
+              if (rectangles_intersect(curr_corners, obj_corners)) {
+                conflict_hint = true;
+                break;
+              }
+            }
+          }
         }
         
-        // 2. Check Other Static/Dynamic Obstacles at ready_time?
-        // Since we park, we should check if we collide with anything currently there.
-        // We assume other robots are moving, but we only care if we hit them *now*.
+        // 2. Check Other Static/Dynamic Obstacles at ready_time and while waiting
         bool conflict_env = false;
         if (!conflict_hint) {
              // Validate against timetable at ready_time
@@ -625,6 +642,35 @@ bool relocate_blocking_robot(RobotMeta* blocker,
                      break;
                  }
              }
+
+               // Critical: also validate future waiting at this parking pose until timetable horizon.
+               // This prevents selecting a pose that is free now but later blocks an existing path.
+               if (!conflict_env) {
+                 double speed = std::max(1e-6, blocker->speed_transit);
+                 double parking_arrival_time = ready_time + (current->cost / speed);
+                 double horizon = timetable.get_max_time();
+                 double dt_future = 0.1;
+
+                 for (double t_check = parking_arrival_time; t_check <= horizon + 1e-6; t_check += dt_future) {
+                   auto future_poses = timetable.get_poses(t_check);
+                   for (auto& [ent, p] : future_poses) {
+                     if (ent == blocker) continue;
+                     // Do NOT skip blocked_traj_hint entity here.
+                     // We must ensure parked pose does not block previously-registered paths later.
+                     if (check_entity_collision(my_geom, {current->x, current->y, current->yaw}, ent, p, params).has_collision) {
+                       conflict_env = true;
+                       future_wait_rejects++;
+                       if (future_wait_rejects % 50 == 0) {
+                         std::cout << "  [Relocate] Future-wait reject x" << future_wait_rejects
+                               << " at (" << current->x << ", " << current->y << ")"
+                               << " due to " << ent->name << " @t=" << t_check << std::endl;
+                       }
+                       break;
+                     }
+                   }
+                   if (conflict_env) break;
+                 }
+               }
         }
 
         if (!conflict_hint && !conflict_env) {
@@ -718,12 +764,138 @@ bool relocate_blocking_robot(RobotMeta* blocker,
         }
     }
 
-    std::cerr << "  [Relocate] FAILED: Could not find clearing motion within iteration limit." << std::endl;
+    std::cerr << "  [Relocate] FAILED: Could not find clearing motion within iteration limit."
+          << " future_wait_rejects=" << future_wait_rejects << std::endl;
     if (moved_out) {
         *moved_out = false;
     }
     return false;
 }
+
+  struct PostGoalCollision {
+    bool has_collision = false;
+    EntityMeta* collider = nullptr;
+    std::string collider_name;
+    double collision_time = 0.0;
+  };
+
+  PostGoalCollision detect_stationary_post_goal_collision(
+      RobotMeta* robot,
+      const Pose& stationary_pose,
+      double start_time,
+      TimeTable& timetable,
+      const Params& params) {
+    PostGoalCollision out;
+    double horizon = timetable.get_max_time();
+    if (horizon <= start_time + 1e-6) {
+      return out;
+    }
+
+    CollisionGeometry robot_geom = setup_collision_geometry(stationary_pose, robot->size, 1.0);
+    double dt = 0.1;
+
+    for (double t = start_time; t <= horizon + 1e-6; t += dt) {
+      auto others = timetable.get_poses(t);
+      for (const auto& [ent, pose] : others) {
+        if (!ent || ent == robot) continue;
+        auto collision = check_entity_collision(robot_geom, stationary_pose, ent, pose, params);
+        if (collision.has_collision) {
+          out.has_collision = true;
+          out.collider = ent;
+          out.collider_name = ent->name;
+          out.collision_time = t;
+          return out;
+        }
+      }
+    }
+
+    return out;
+  }
+
+  Trajectory build_future_hint_trajectory(
+      EntityMeta* moving_entity,
+      double start_time,
+      double end_time,
+      TimeTable& timetable) {
+    Trajectory hint;
+    hint.entity = moving_entity;
+    hint.start_time = start_time;
+    hint.is_transfer = false;
+
+    if (!moving_entity || end_time <= start_time + 1e-6) {
+      return hint;
+    }
+
+    double dt = 0.1;
+    for (double t = start_time; t <= end_time + 1e-6; t += dt) {
+      Pose p = timetable.get_pose(moving_entity, t);
+      Waypoint wp;
+      wp.x = p.x;
+      wp.y = p.y;
+      wp.yaw = p.yaw;
+      wp.time = t - start_time;
+      hint.waypoints.push_back(wp);
+    }
+
+    if (hint.waypoints.size() == 1) {
+      Waypoint wp = hint.waypoints.front();
+      wp.time = 0.1;
+      hint.waypoints.push_back(wp);
+    }
+
+    return hint;
+  }
+
+  bool resolve_post_goal_conflict_after_add(
+      RobotMeta* robot,
+      double traj_end_time,
+      TimeTable& timetable,
+      const Params& params,
+      const std::unordered_map<std::string, EntityMeta*>& entities,
+      bool has_following_segment) {
+    Pose stationary_pose = timetable.get_pose(robot, traj_end_time);
+    PostGoalCollision post_col = detect_stationary_post_goal_collision(
+        robot, stationary_pose, traj_end_time, timetable, params);
+
+    if (!post_col.has_collision) {
+      return true;
+    }
+
+    std::cout << "  [PostGoal] " << robot->name
+              << " would collide after path end at t=" << post_col.collision_time
+              << " with " << post_col.collider_name << std::endl;
+
+    if (has_following_segment) {
+      std::cout << "  [PostGoal] Deferring conflict handling because next segment exists." << std::endl;
+      return true;
+    }
+
+    std::cout << "  [PostGoal] No following segment. Relocating " << robot->name
+              << " to safe parking." << std::endl;
+
+    Trajectory hint = build_future_hint_trajectory(
+        post_col.collider, post_col.collision_time, timetable.get_max_time(), timetable);
+    bool moved = false;
+    const Trajectory* hint_ptr = hint.waypoints.empty() ? nullptr : &hint;
+
+    if (!relocate_blocking_robot(robot, timetable, params, entities, hint_ptr, &moved)) {
+      std::cerr << "  [PostGoal] Failed to relocate " << robot->name
+                << " after post-goal conflict." << std::endl;
+      return false;
+    }
+
+    double new_end_time = timetable.get_entity_max_time(robot, 0.0);
+    Pose new_stationary_pose = timetable.get_pose(robot, new_end_time);
+    PostGoalCollision recheck = detect_stationary_post_goal_collision(
+        robot, new_stationary_pose, new_end_time, timetable, params);
+    if (recheck.has_collision) {
+      std::cerr << "  [PostGoal] Conflict still remains after relocation: "
+                << recheck.collider_name << " at t=" << recheck.collision_time << std::endl;
+      return false;
+    }
+
+    return true;
+  }
 
 // ==========================================
 // UPDATED: PLAN INITIAL TRANSIT
@@ -876,6 +1048,12 @@ bool plan_initial_transit(
   transit_traj.waypoints = path_res.waypoints;
   transit_traj.is_transfer = false;
   timetable.add_trajectory(transit_traj);
+
+  double transit_end_time = transit_traj.start_time + transit_traj.waypoints.back().time;
+  if (!resolve_post_goal_conflict_after_add(robot, transit_end_time, timetable, params, entities, true)) {
+    std::cerr << "  [Transit] Post-goal conflict unresolved." << std::endl;
+    return false;
+  }
 
   return true;
 }
@@ -1091,13 +1269,39 @@ Task* get_task_at_time(RobotMeta* robot, double time) {
     return nullptr;
 }
 
+void visualize_segment_failure_instance(
+    TimeTable& timetable,
+    const std::unordered_map<std::string, EntityMeta *>& entities,
+    const Params& params,
+    const Trajectory& traj,
+    double attempted_start_time,
+    const CollisionInfo& last_motion_collision,
+    const std::string& fail_tag) {
+  double query_t = attempted_start_time;
+  if (!last_motion_collision.is_valid && last_motion_collision.time > 0.0) {
+    query_t = last_motion_collision.time;
+  }
+
+  Pose start_pose = timetable.get_pose(traj.entity, attempted_start_time);
+  Pose goal_pose = start_pose;
+  if (!traj.waypoints.empty()) {
+    const Waypoint& goal_wp = traj.waypoints.back();
+    goal_pose = {goal_wp.x, goal_wp.y, goal_wp.yaw};
+  }
+
+  std::cout << "  [DebugViz] Segment failure " << fail_tag
+            << " at t=" << query_t << " (start=" << attempted_start_time << ")" << std::endl;
+  visualize_current_state(timetable, entities, params, query_t, start_pose, goal_pose);
+}
+
 // Helper function to handle the scheduling of a single path segment
 // Helper function to handle the scheduling of a single path segment
 bool schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
                            RobotMeta *robot, TimeTable &timetable,
                            const Params &params,
                            const std::unordered_map<std::string, EntityMeta *> &entities,
-                           Task* current_task) { // Added current_task for coin attribution
+                           Task* current_task,
+                           bool has_following_segment = false) { // Added current_task for coin attribution
                            
   // 1. Get current available time from the timetable
   double current_avail_time = timetable.get_entity_max_time(robot);
@@ -1125,11 +1329,18 @@ bool schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
   // Inline "Find Safe Start Time" with Coin Logic
   double check_time = current_avail_time;
   double step = 0.5;
-  int max_retries = 200; 
+  double wait_horizon = std::max(100.0, (timetable.get_max_time() - current_avail_time) + 120.0);
+  int max_retries = std::max(200, static_cast<int>(std::ceil(wait_horizon / step))); 
 
   std::string last_relocated_robot_name = "";
   double last_relocation_time = -100.0;
-  std::unordered_set<std::string> no_progress_blockers;
+  std::unordered_map<std::string, double> no_progress_blockers;
+  int post_goal_reject_count = 0;
+  std::string last_post_goal_entity = "";
+  double last_post_goal_time = -1.0;
+  int relocation_attempts = 0;
+  int relocation_failures = 0;
+  CollisionInfo last_motion_collision{true, "", "", 0.0};
   
   // Track wait duration for this segment
   double wait_duration = 0.0;
@@ -1137,8 +1348,34 @@ bool schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
   bool success = false;
   for (int i = 0; i < max_retries; ++i) {
     CollisionInfo col_info = check_collision_trajectory_detailed(*traj, check_time, timetable, params, false);
+    if (!col_info.is_valid) {
+      last_motion_collision = col_info;
+    }
     
     if (col_info.is_valid) {
+      // Deadlock guard: if next segment exists, avoid entering a goal-wait state
+      // that will collide with already-registered (older) trajectories.
+      if (has_following_segment && !traj->waypoints.empty()) {
+        double end_time = check_time + traj->waypoints.back().time;
+        Pose end_pose = {traj->waypoints.back().x, traj->waypoints.back().y, traj->waypoints.back().yaw};
+        PostGoalCollision post_col = detect_stationary_post_goal_collision(
+          robot, end_pose, end_time, timetable, params);
+        if (post_col.has_collision) {
+          post_goal_reject_count++;
+          last_post_goal_entity = post_col.collider_name;
+          last_post_goal_time = post_col.collision_time;
+          if (post_goal_reject_count % 20 == 0) {
+            std::cout << "  [PostGoal-Delay] Task " << current_task->id
+                      << " " << robot->name << " candidate delayed " << post_goal_reject_count
+                      << " times due to post-goal conflict with " << post_col.collider_name
+                      << " at t=" << post_col.collision_time << std::endl;
+          }
+          check_time += step;
+          wait_duration += step;
+          continue;
+        }
+      }
+
         // Success
         success = true;
         break;
@@ -1163,8 +1400,11 @@ bool schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
         double blocker_free_time = timetable.get_entity_max_time(blocker);
         if (col_info.time > blocker_free_time) {
             // Blocker is stationary. Relocate.
-           if (!no_progress_blockers.count(blocker->name) &&
+           bool can_retry_no_progress = (!no_progress_blockers.count(blocker->name) ||
+             (check_time - no_progress_blockers[blocker->name] > 20.0));
+           if (can_retry_no_progress &&
              (blocker->name != last_relocated_robot_name || (check_time - last_relocation_time > 5.0))) {
+            relocation_attempts++;
             bool moved = false;
             if (relocate_blocking_robot(blocker, timetable, params, entities, traj.get(), &moved)) {
                     last_relocated_robot_name = blocker->name;
@@ -1172,10 +1412,11 @@ bool schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
               if (moved) {
                 check_time -= step; // Retry same time only when blocker actually moved
               } else {
-                no_progress_blockers.insert(blocker->name);
+                no_progress_blockers[blocker->name] = check_time;
               }
                 } else {
                     // Relocation Failed. Abort.
+                  relocation_failures++;
                     std::cerr << "    [Abort] Unmovable blocker " << blocker->name << " on path." << std::endl;
                     success = false;
                     break;
@@ -1195,7 +1436,30 @@ bool schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
   double safe_start_time = success ? check_time : -1.0;
 
   if (safe_start_time < 0) {
-       std::cerr << " [Error] Segment failed." << std::endl;
+       std::cerr << " [Error] Segment failed."
+                 << " task=" << current_task->id
+                 << " robot=" << robot->name
+                 << " start_ready=" << current_avail_time
+                 << " retries=" << max_retries
+                 << " waited=" << wait_duration
+                 << " post_goal_rejects=" << post_goal_reject_count;
+       if (!last_post_goal_entity.empty()) {
+         std::cerr << " last_post_goal_blocker=" << last_post_goal_entity
+                   << "@t=" << last_post_goal_time;
+       }
+       if (!last_motion_collision.is_valid) {
+         std::cerr << " last_motion_collision=(" << last_motion_collision.reason
+                   << ", entity=" << last_motion_collision.entity_name
+                   << ", t=" << last_motion_collision.time << ")";
+       }
+       std::cerr << " relocate_attempts=" << relocation_attempts
+                 << " relocate_failures=" << relocation_failures
+                 << std::endl;
+
+         visualize_segment_failure_instance(
+           timetable, entities, params, *traj, check_time, last_motion_collision,
+           "schedule_path_segment task=" + std::to_string(current_task->id));
+
        return false; 
   }
 
@@ -1203,6 +1467,13 @@ bool schedule_path_segment(const EdgePath &edge_path, EntityMeta *obj_meta,
   traj->start_time = safe_start_time;
   traj->CalcualteTimeStamps(robot);
   timetable.add_trajectory(*traj);
+
+  double segment_end_time = traj->start_time + traj->waypoints.back().time;
+  if (!resolve_post_goal_conflict_after_add(robot, segment_end_time, timetable, params, entities, has_following_segment)) {
+      std::cerr << " [Error] Post-goal conflict unresolved after segment." << std::endl;
+      return false;
+  }
+
   return true;
 }
 
@@ -1251,17 +1522,24 @@ bool process_task_execution_instrumented(
 
       if (task.obsReloPaths->size() > post_path_idx) {
       if (task.obsReloPaths->size() > post_path_idx) {
+        bool has_more_obs_after_this = (obs_ind + 1 < task.vertexChain.size() - 1);
+        bool has_edge_paths_after_obs = !task.EdgePaths.empty();
+        bool push_has_following = true; // post path follows
+        bool post_has_following = has_more_obs_after_this || has_edge_paths_after_obs;
+
         if (!schedule_path_segment(task.obsReloPaths->at(push_path_idx), obs_meta,
-                              robot, timetable, params, entities, &task)) return false;
+                              robot, timetable, params, entities, &task, push_has_following)) return false;
         if (!schedule_path_segment(task.obsReloPaths->at(post_path_idx), obs_meta,
-                              robot, timetable, params, entities, &task)) return false;
+                              robot, timetable, params, entities, &task, post_has_following)) return false;
       }
       }
     }
   }
 
   // 3. Execute Edge Paths
-  for (auto &path_ptr : task.EdgePaths) {
+  for (size_t path_i = 0; path_i < task.EdgePaths.size(); ++path_i) {
+    auto &path_ptr = task.EdgePaths[path_i];
+    bool has_following_segment = (path_i + 1 < task.EdgePaths.size());
     double segment_ready_time = timetable.get_entity_max_time(robot);
     path_ptr->entity = robot;
     path_ptr->CalcualteTimeStamps(robot);
@@ -1282,17 +1560,51 @@ bool process_task_execution_instrumented(
     // Inline Safe Start Instrumented
     double check_time = segment_ready_time;
     double step = 0.5;
-    int max_retries = 200;
+    double wait_horizon = std::max(100.0, (timetable.get_max_time() - segment_ready_time) + 120.0);
+    int max_retries = std::max(200, static_cast<int>(std::ceil(wait_horizon / step)));
     std::string last_relocated_robot = "";
     double last_relocation_time = -100.0;
-    std::unordered_set<std::string> no_progress_blockers;
+    std::unordered_map<std::string, double> no_progress_blockers;
+    int post_goal_reject_count = 0;
+    std::string last_post_goal_entity = "";
+    double last_post_goal_time = -1.0;
+    int relocation_attempts = 0;
+    int relocation_failures = 0;
+    CollisionInfo last_motion_collision{true, "", "", 0.0};
     double wait_val = 0.0;
     bool seg_success = false;
     
     for (int i = 0; i < max_retries; ++i) {
         CollisionInfo col_info = check_collision_trajectory_detailed(*traj, check_time, timetable, params, false);
+        if (!col_info.is_valid) {
+          last_motion_collision = col_info;
+        }
      
         if (col_info.is_valid) {
+        // Deadlock guard: if another segment follows, reject start times that
+        // cause post-goal waiting collisions with older timetable trajectories.
+        if (has_following_segment && !traj->waypoints.empty()) {
+          double end_time = check_time + traj->waypoints.back().time;
+          Pose end_pose = {traj->waypoints.back().x, traj->waypoints.back().y, traj->waypoints.back().yaw};
+          PostGoalCollision post_col = detect_stationary_post_goal_collision(
+            robot, end_pose, end_time, timetable, params);
+          if (post_col.has_collision) {
+            post_goal_reject_count++;
+            last_post_goal_entity = post_col.collider_name;
+            last_post_goal_time = post_col.collision_time;
+            if (post_goal_reject_count % 20 == 0) {
+              std::cout << "  [PostGoal-Delay] Task " << task.id
+                        << " EdgeIdx=" << path_i
+                        << " " << robot->name << " delayed " << post_goal_reject_count
+                        << " times due to " << post_col.collider_name
+                        << "@t=" << post_col.collision_time << std::endl;
+            }
+            check_time += step;
+            wait_val += step;
+            continue;
+          }
+        }
+
             seg_success = true;
             break;
         }
@@ -1309,8 +1621,11 @@ bool process_task_execution_instrumented(
                  
                  // Relocate logic
                  if (col_info.time > timetable.get_entity_max_time(blocker)) {
-                    if (!no_progress_blockers.count(blocker->name) &&
+                    bool can_retry_no_progress = (!no_progress_blockers.count(blocker->name) ||
+                      (check_time - no_progress_blockers[blocker->name] > 20.0));
+                    if (can_retry_no_progress &&
                       (blocker->name != last_relocated_robot || (check_time - last_relocation_time > 5.0))) {
+                    relocation_attempts++;
                     bool moved = false;
                     if (relocate_blocking_robot(blocker, timetable, params, entities, traj.get(), &moved)) {
                             last_relocated_robot = blocker->name;
@@ -1318,9 +1633,10 @@ bool process_task_execution_instrumented(
                       if (moved) {
                         check_time -= step;
                       } else {
-                        no_progress_blockers.insert(blocker->name);
+                        no_progress_blockers[blocker->name] = check_time;
                       }
                         } else {
+                              relocation_failures++;
                              std::cerr << "    [Abort] Unmovable blocker " << blocker->name << " on path (EdgePath)." << std::endl;
                              seg_success = false;
                              break;
@@ -1335,7 +1651,31 @@ bool process_task_execution_instrumented(
     }
     
     if (!seg_success) {
-        std::cerr << "Segment failed." << std::endl;
+        std::cerr << "[Error] Segment failed."
+                  << " task=" << task.id
+                  << " edge_idx=" << path_i
+                  << " robot=" << robot->name
+                  << " start_ready=" << segment_ready_time
+                  << " retries=" << max_retries
+                  << " waited=" << wait_val
+                  << " post_goal_rejects=" << post_goal_reject_count;
+        if (!last_post_goal_entity.empty()) {
+          std::cerr << " last_post_goal_blocker=" << last_post_goal_entity
+                    << "@t=" << last_post_goal_time;
+        }
+        if (!last_motion_collision.is_valid) {
+          std::cerr << " last_motion_collision=(" << last_motion_collision.reason
+                    << ", entity=" << last_motion_collision.entity_name
+                    << ", t=" << last_motion_collision.time << ")";
+        }
+        std::cerr << " relocate_attempts=" << relocation_attempts
+                  << " relocate_failures=" << relocation_failures
+                  << std::endl;
+
+        visualize_segment_failure_instance(
+          timetable, entities, params, *traj, check_time, last_motion_collision,
+          "edge_loop task=" + std::to_string(task.id) + " edge_idx=" + std::to_string(path_i));
+
         return false;
     }
     
@@ -1348,6 +1688,19 @@ bool process_task_execution_instrumented(
     if (traj->is_transfer) {
       append_retraction(robot, *traj, timetable);
     }
+
+    double check_from_time = timetable.get_entity_max_time(robot, 0.0);
+    if (!resolve_post_goal_conflict_after_add(robot, check_from_time, timetable, params, entities, has_following_segment)) {
+      std::cerr << " [Error] Post-goal conflict unresolved in edge execution." << std::endl;
+      return false;
+    }
+  }
+
+  // Final post-task stationary check: no following segment remains.
+  double final_check_time = timetable.get_entity_max_time(robot, 0.0);
+  if (!resolve_post_goal_conflict_after_add(robot, final_check_time, timetable, params, entities, false)) {
+    std::cerr << " [Error] Final post-goal conflict unresolved for task " << task.id << std::endl;
+    return false;
   }
   
   double end_record_time = timetable.get_entity_max_time(robot);
@@ -1374,6 +1727,9 @@ void solve_allocation(std::vector<Task>& tasks, std::vector<RobotMeta*>& robots,
 
     // Atomic task attempt: if planning fails, rollback any partial side-effects.
     auto try_process_task_atomic = [&](RobotMeta* candidate, Task& task) {
+      size_t label_count_before = timetable.get_trajectory_labels().size();
+      double makespan_before = timetable.get_max_time();
+
       TimeTable timetable_backup = timetable;
       double blocker_backup = task.blocker_coins;
       double waiter_backup = task.waiter_coins;
@@ -1386,12 +1742,32 @@ void solve_allocation(std::vector<Task>& tasks, std::vector<RobotMeta*>& robots,
 
       bool ok = process_task_execution_instrumented(candidate, task, timetable, entities, params);
       if (!ok) {
+        size_t label_count_after = timetable.get_trajectory_labels().size();
+        if (label_count_after > label_count_before) {
+          std::cout << "    [Rollback] Task " << task.id
+                    << " with " << candidate->name
+                    << " discarded tentative paths ["
+                    << (label_count_before + 1) << ".." << label_count_after << "]"
+                    << " tentative_makespan=" << timetable.get_max_time()
+                    << " final_makespan=" << makespan_before
+                    << std::endl;
+        }
         timetable = timetable_backup;
         task.blocker_coins = blocker_backup;
         task.waiter_coins = waiter_backup;
         task.deadlock_coins = deadlock_backup;
         for (const auto& [r, pose] : robot_pose_backup) {
           r->initial_pose = pose;
+        }
+      } else {
+        size_t label_count_after = timetable.get_trajectory_labels().size();
+        if (label_count_after > label_count_before) {
+          std::cout << "    [Commit] Task " << task.id
+                    << " with " << candidate->name
+                    << " committed paths ["
+                    << (label_count_before + 1) << ".." << label_count_after << "]"
+                    << " makespan=" << timetable.get_max_time()
+                    << std::endl;
         }
       }
       return ok;
